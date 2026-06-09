@@ -739,6 +739,18 @@ Error gc_execute_line(const char* input_line) {
                         gc_block.modal.io_control = IoControl::SetAnalogImmediate;
                         mg_word_bit               = ModalGroup::MM5;
                         break;
+                    case 101:  // Enable plasma Torch Height Control
+                        gc_block.modal.thc = ThcControl::Enable;
+                        mg_word_bit        = ModalGroup::MM10;
+                        break;
+                    case 102:  // Disable plasma Torch Height Control
+                        gc_block.modal.thc = ThcControl::Disable;
+                        mg_word_bit        = ModalGroup::MM10;
+                        break;
+                    case 103:  // Set THC target arc voltage: M103 Q<volts>
+                        gc_block.modal.thc = ThcControl::SetVoltage;
+                        mg_word_bit        = ModalGroup::MM10;
+                        break;
                     default:
                         return Error::GcodeUnsupportedCommand;  // [Unsupported M command]
                 }
@@ -1108,6 +1120,14 @@ Error gc_execute_line(const char* input_line) {
         clear_bitnum(value_words, GCodeWord::Q);
     }
     if (gc_block.modal.set_tool_number == SetToolNumber::Enable) {
+        if (bitnum_is_false(value_words, GCodeWord::Q)) {
+            return Error::GcodeValueWordMissing;
+        }
+        clear_bitnum(value_words, GCodeWord::Q);
+    }
+
+    // M103 Q<volts> requires a Q word (the target arc voltage); M101/M102 take none.
+    if (gc_block.modal.thc == ThcControl::SetVoltage) {
         if (bitnum_is_false(value_words, GCodeWord::Q)) {
             return Error::GcodeValueWordMissing;
         }
@@ -1793,6 +1813,28 @@ Error gc_execute_line(const char* input_line) {
         auto const timeout      = gc_block.values.q;
         protocol_buffer_synchronize();  // read at this point in the program (synchronized with motion)
         gc_wait_on_input(isWaitOnInputDigital, input_number, wait_mode, timeout);
+    }
+
+    // [8.x. Plasma Torch Height Control ]: M101 enable, M102 disable, M103 Q<volts> set target.
+    if (gc_block.modal.thc != ThcControl::None) {
+        if (config->_thc == nullptr) {
+            return Error::GcodeUnsupportedCommand;  // no `thc:` section configured
+        }
+        switch (gc_block.modal.thc) {
+            case ThcControl::Enable:
+                protocol_buffer_synchronize();  // engage at the motion boundary, like M62/M63
+                config->_thc->enable();
+                break;
+            case ThcControl::Disable:
+                protocol_buffer_synchronize();
+                config->_thc->disable();
+                break;
+            case ThcControl::SetVoltage:
+                config->_thc->setTargetVoltage(gc_block.values.q);
+                break;
+            case ThcControl::None:
+                break;
+        }
     }
 
     // [9. Override control ]: NOT SUPPORTED. Always enabled, except for parking control.

@@ -29,6 +29,7 @@
 #include "I2SOBus.h"
 #include "UserOutputs.h"
 #include "UserInputs.h"
+#include "THC.h"
 #include "Macros.h"
 
 #include <string_view>
@@ -78,6 +79,7 @@ namespace Machine {
         Control*        _control     = nullptr;
         UserOutputs*    _userOutputs = nullptr;
         UserInputs*     _userInputs  = nullptr;
+        THC*            _thc         = nullptr;  // null unless a `thc:` section is present
         SDCard*         _sdCard      = nullptr;
         Macros*         _macros      = nullptr;
         Start*          _start       = nullptr;

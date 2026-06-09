@@ -1,0 +1,71 @@
+board: ESP32 Dev
+name: Plasma Table with AVTHC
+
+# Automatic Voltage Torch Height Control (AVTHC) example.
+#
+# The torch itself is fired with digital I/O (M62/M63/M64/M65) from the program
+# or an M6 tool-change subroutine -- NOT M3/M5 -- so a real router spindle can run
+# alongside.  M3/M5/S stay dedicated to that spindle.
+#
+# THC G-code:
+#   M101            enable THC (motion-synchronized)
+#   M102            disable THC (motion-synchronized)
+#   M103 Q<volts>   set the target arc voltage.  Q at/below min_arc_voltage = off.
+#
+# The Z axis must use the direct-GPIO "timed" step engine for THC step injection.
+
+stepping:
+  engine: timed
+  idle_ms: 250
+  pulse_us: 4
+  dir_delay_us: 1
+  disable_delay_us: 0
+
+axes:
+  x:
+    steps_per_mm: 200.000
+    max_rate_mm_per_min: 10000.000
+    acceleration_mm_per_sec2: 300.000
+    max_travel_mm: 1500.000
+    motor0:
+      standard_stepper:
+        step_pin: gpio.12
+        direction_pin: gpio.14
+        disable_pin: gpio.26
+
+  y:
+    steps_per_mm: 200.000
+    max_rate_mm_per_min: 10000.000
+    acceleration_mm_per_sec2: 300.000
+    max_travel_mm: 3000.000
+    motor0:
+      standard_stepper:
+        step_pin: gpio.27
+        direction_pin: gpio.33
+        disable_pin: gpio.26
+
+  z:
+    steps_per_mm: 200.000
+    max_rate_mm_per_min: 3000.000
+    acceleration_mm_per_sec2: 100.000
+    max_travel_mm: 150.000
+    motor0:
+      standard_stepper:
+        step_pin: gpio.15
+        direction_pin: gpio.2
+        disable_pin: gpio.26
+
+thc:
+  arc_voltage_pin: gpio.36        # ADC1 input carrying the divided arc voltage
+  arc_voltage_scale: 230.0        # divider ratio (raw pin volts -> arc volts)
+  arc_voltage_offset: 0.0
+  arc_ok_pin: gpio.39:low         # asserted (active-low) when the arc is established
+  min_arc_voltage: 30             # M103 Q at/below this disables correction
+  target_voltage: 0               # seeded until a program sends M103 Q
+  threshold_volts: 2.0            # deadband around the target
+  pid_p: 10.0                     # proportional gain (volts -> step rate)
+  vad_threshold_pct: 65           # velocity anti-dive; 0 disables
+  thc_delay_ms: 300               # stabilization delay after the arc establishes
+  max_z_rate_mm_min: 600          # caps the injected Z correction rate
+  avg_samples: 5                  # arc-voltage moving-average window
+  invert_z: false                 # set true if +Z lowers the torch on your machine

@@ -77,6 +77,16 @@ namespace Machine {
         static void step(AxisMask step_mask, AxisMask dir_mask);
         static void unstep();
 
+        // THC: directly pulse one axis's motor pin(s) via raw GPIO, bypassing the
+        // step-segment engine, and track the executed position in axis_steps so the
+        // DRO/mpos stays exact.  This lets the Torch Height Control move Z while the
+        // program streams X/Y (the program holds Z, so the main stepper ISR never
+        // includes the Z bit and there is no contention).  `positive` moves the axis
+        // in the +machine direction, matching step() with the axis's dir-mask bit clear.
+        // Requires the TIMED (direct-GPIO) step engine -- see thcCanStep().
+        static void thcStep(axis_t axis, bool positive);
+        static bool thcCanStep(axis_t axis);
+
         // Used to stop a motor quickly when a limit switch is hit
         static bool* limit_var(axis_t axis, motor_t motor);
         static void  limit(axis_t axis, motor_t motor);

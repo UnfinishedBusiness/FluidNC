@@ -598,6 +598,11 @@ void report_realtime_status(Channel& channel) {
         msg << "|UIO:" << user_io;
     }
 
+    // Plasma: arc voltage + arc-ok are always reported when THC is configured.
+    if (config->_thc) {
+        config->_thc->status_report(msg);
+    }
+
     if (report_wco_counter > 0) {
         report_wco_counter--;
     } else {

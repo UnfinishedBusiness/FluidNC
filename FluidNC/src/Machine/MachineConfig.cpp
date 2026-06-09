@@ -77,6 +77,10 @@ namespace Machine {
         handler.section("user_outputs", _userOutputs);
         handler.section("user_inputs", _userInputs);
 
+        // Torch Height Control (plasma).  Left null when absent, so non-plasma
+        // configs are unaffected.
+        handler.section("thc", _thc);
+
         ConfigurableModuleFactory::factory(handler);
         ATCs::ATCFactory::factory(handler);
         Spindles::SpindleFactory::factory(handler);

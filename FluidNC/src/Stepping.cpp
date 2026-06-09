@@ -2,6 +2,8 @@
 #include "EnumItem.h"
 #include "Stepping.h"
 #include "Machine/MachineConfig.h"  // config
+#include "Driver/fluidnc_gpio.h"    // gpio_write
+#include "Driver/delay_usecs.h"     // delay_us
 
 #include <atomic>
 
@@ -185,6 +187,47 @@ void IRAM_ATTR Stepping::unstep() {
         }
     }
     step_engine->finish_unstep();
+}
+
+// THC can only inject Z steps when the axis is driven by the direct-GPIO TIMED
+// engine.  For RMT/I2S the motor pins are buffered/streamed and cannot be safely
+// toggled out-of-band, so the THC must stay disabled (the caller warns the user).
+bool Stepping::thcCanStep(axis_t axis) {
+    return _engine == TIMED && axis < MAX_N_AXIS && axis_motors[axis][0] != nullptr;
+}
+
+// Pulse one axis's motor pin(s) directly, the way a normal step() pulse would,
+// but without touching the step-segment engine's batch state.  Mirrors step()'s
+// direction convention: a clear dir bit (positive) increments axis_steps, a set
+// dir bit decrements it.  Runs in the THC service context (a FreeRTOS task), not
+// an ISR, so the short blocking delays are fine.
+void Stepping::thcStep(axis_t axis, bool positive) {
+    bool dir_bit = !positive;  // step(): dir-mask bit set => negative increment
+
+    for (size_t motor = 0; motor < MAX_MOTORS_PER_AXIS; motor++) {
+        auto m = axis_motors[axis][motor];
+        if (m && !m->blocked && !m->limited) {
+            gpio_write(m->dir_pin, dir_bit ^ m->dir_invert);
+        }
+    }
+    delay_us(_directionDelayUsecs ? _directionDelayUsecs : 2);
+
+    for (size_t motor = 0; motor < MAX_MOTORS_PER_AXIS; motor++) {
+        auto m = axis_motors[axis][motor];
+        if (m && !m->blocked && !m->limited) {
+            gpio_write(m->step_pin, !m->step_invert);
+        }
+    }
+    delay_us(_pulseUsecs ? _pulseUsecs : 4);
+
+    for (size_t motor = 0; motor < MAX_MOTORS_PER_AXIS; motor++) {
+        auto m = axis_motors[axis][motor];
+        if (m && !m->blocked && !m->limited) {
+            gpio_write(m->step_pin, m->step_invert);
+        }
+    }
+
+    axis_steps[axis] += positive ? 1 : -1;
 }
 
 void Stepping::reset() {}

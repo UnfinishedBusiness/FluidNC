@@ -168,6 +168,16 @@ enum class IoControl : gcodenum_t {
     SetAnalogImmediate  = 7,  // M68
 };
 
+// Plasma Torch Height Control commands (user-defined M-code band).
+// Like IoControl, this is a per-block action that is not committed back into
+// gc_state.modal, so it never re-fires on a following block.
+enum class ThcControl : gcodenum_t {
+    None       = 0,
+    Enable     = 1,  // M101
+    Disable    = 2,  // M102
+    SetVoltage = 3,  // M103 Q<volts>
+};
+
 // {M66} L word value, indicates wait mode
 enum class WaitOnInputMode : int8_t {
     Immediate,
@@ -278,6 +288,7 @@ struct gc_modal_t {
     SetToolNumber set_tool_number;
     IoControl     io_control;  // {M62, M63, M67}
     Override      override;    // {M56}
+    ThcControl    thc;         // {M101, M102, M103} plasma torch height control
 };
 
 struct gc_values_t {

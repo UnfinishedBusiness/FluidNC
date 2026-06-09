@@ -127,6 +127,10 @@ void setup() {
 
         config->_kinematics->init();
 
+        if (config->_thc) {
+            config->_thc->init();  // plasma Torch Height Control (after Stepping/Axes are up)
+        }
+
         limits_init();
 
         // Initialize system state.
