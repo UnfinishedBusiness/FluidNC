@@ -23,6 +23,10 @@ namespace Pins {
         pinnum_t    _index    = INVALID_PINNUM;
         bool        _inverted = false;
 
+        // True when the pin was declared with the ":report" option, requesting that its
+        // live state be included in the `?` status report.  Only consumed for user I/O.
+        bool _reportInStatus = false;
+
         PinDetail(pinnum_t index) : _index(index) {}
         PinDetail(const PinDetail& o)            = delete;
         PinDetail(PinDetail&& o)                 = delete;
@@ -49,6 +53,8 @@ namespace Pins {
         const char* name() { return _name.c_str(); }
 
         inline pinnum_t number() const { return _index; }
+
+        bool reportInStatus() const { return _reportInStatus; }
 
         virtual ~PinDetail() {}
     };

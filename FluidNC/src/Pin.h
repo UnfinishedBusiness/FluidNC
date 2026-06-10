@@ -110,6 +110,7 @@ public:
         }
         return _detail->_index;
     }
+    inline bool     reportInStatus() const { return _detail->reportInStatus(); }
     inline int8_t   driveStrength() const { return _detail->driveStrength(); }
     inline bool     canStep() { return _detail->canStep(); }
     inline pinnum_t index() { return _detail->_index; }

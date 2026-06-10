@@ -490,6 +490,49 @@ void report_recompute_pin_string() {
     }
 }
 
+// Builds the |UIO: field listing the live state of every user-I/O pin declared with
+// the ":report" option, e.g. "DO0=1,DI3=0,AO1=40".  Empty when none are flagged.
+//   DO = digital output (M62-65)   AO = analog output (M67/68), value = percent
+//   DI = digital input  (M66 P)    AI = analog input  (M66 E), boolean for now
+static std::string report_user_io_string() {
+    std::string s;
+    auto append = [&](const char* type, size_t i, int val) {
+        if (!s.empty()) {
+            s += ',';
+        }
+        s += type;
+        s += std::to_string(i);
+        s += '=';
+        s += std::to_string(val);
+    };
+
+    if (auto* out = config->_userOutputs) {
+        for (size_t i = 0; i < MaxUserDigitalPin; i++) {
+            if (out->_digitalOutput[i].defined() && out->_digitalOutput[i].reportInStatus()) {
+                append("DO", i, out->getDigital(i) ? 1 : 0);
+            }
+        }
+        for (size_t i = 0; i < MaxUserAnalogPin; i++) {
+            if (out->_analogOutput[i].defined() && out->_analogOutput[i].reportInStatus()) {
+                append("AO", i, (int)(out->getAnalogPercent(i) + 0.5f));
+            }
+        }
+    }
+    for (size_t i = 0; i < MaxUserDigitalPin; i++) {
+        auto& pin = Machine::UserInputs::digitalInput[i];
+        if (pin.defined() && pin.reportInStatus()) {
+            append("DI", i, pin.get() ? 1 : 0);
+        }
+    }
+    for (size_t i = 0; i < MaxUserAnalogPin; i++) {
+        auto& pin = Machine::UserInputs::analogInput[i];
+        if (pin.defined() && pin.reportInStatus()) {
+            append("AI", i, pin.get() ? 1 : 0);
+        }
+    }
+    return s;
+}
+
 // Define this to do something if a debug request comes in over serial
 void report_realtime_debug() {}
 
@@ -539,6 +582,12 @@ void report_realtime_status(Channel& channel) {
 
     if (report_pin_string.length()) {
         msg << "|Pn:" << report_pin_string;
+    }
+
+    // Live user-I/O states for pins flagged with :report (drives sender indicators).
+    std::string user_io = report_user_io_string();
+    if (user_io.length()) {
+        msg << "|UIO:" << user_io;
     }
 
     if (report_wco_counter > 0) {

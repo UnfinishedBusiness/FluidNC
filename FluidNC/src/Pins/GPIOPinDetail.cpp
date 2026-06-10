@@ -73,6 +73,10 @@ namespace Pins {
                 // The first (non-shared) declaration owns the pin and configures it.
                 _shared = true;
                 _name += ":shared";
+            } else if (opt.is("report")) {
+                // Request that this user-I/O pin's state appear in the ? status report.
+                _reportInStatus = true;
+                _name += ":report";
             } else {
                 Assert(false, "Bad GPIO option passed to pin %d: %.*s", int(index), static_cast<int>(opt().length()), opt().data());
             }

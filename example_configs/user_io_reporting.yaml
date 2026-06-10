@@ -1,0 +1,36 @@
+board: ESP32 Dev
+name: User-I/O status reporting example
+
+# Demonstrates the :report attribute, which adds a user-I/O pin's live state to the
+# `?` status report so a sender/pendant can drive indicators.  See
+# ../docs/user_io_reporting.md.
+#
+# With the pins below, a status report looks like:
+#   <Idle|MPos:...|UIO:DO0=1,AO0=40,DI0=0>
+#
+# :report is opt-in per pin; pins without it are not reported and behave as before.
+
+stepping:
+  engine: RMT
+  idle_ms: 250
+  pulse_us: 4
+
+axes:
+  x:
+    steps_per_mm: 200.000
+    max_rate_mm_per_min: 5000.000
+    acceleration_mm_per_sec2: 100.000
+    max_travel_mm: 300.000
+    motor0:
+      standard_stepper:
+        step_pin: gpio.12
+        direction_pin: gpio.14
+        disable_pin: gpio.26
+
+user_outputs:
+  digital0_pin: gpio.16:report      # e.g. torch/relay -> reports DO0 on/off (M62/M63 P0)
+  analog0_pin:  gpio.25:report      # PWM output      -> reports AO0 percent (M67 E0 Q..)
+  analog0_hz:   5000
+
+user_inputs:
+  digital0_pin: gpio.34:report      # e.g. material-present sensor -> reports DI0 (M66 P0)

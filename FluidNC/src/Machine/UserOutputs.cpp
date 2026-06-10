@@ -48,6 +48,7 @@ namespace Machine {
             return !isOn;  // It is okay to turn off an undefined pin, for safety
         }
         pin.synchronousWrite(isOn);
+        _digitalState[io_num] = isOn;
         return true;
     }
 
@@ -66,6 +67,7 @@ namespace Machine {
         }
 
         _current_value[io_num] = duty;
+        _analogPercent[io_num] = percent;
 
         pin.setDuty(duty);
 

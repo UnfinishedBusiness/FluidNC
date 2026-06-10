@@ -11,6 +11,10 @@ namespace Machine {
     class UserOutputs : public Configuration::Configurable {
         uint32_t _current_value[MaxUserAnalogPin];
 
+        // Last commanded state, kept so it can be surfaced in the status report.
+        bool  _digitalState[MaxUserDigitalPin] = { false };
+        float _analogPercent[MaxUserAnalogPin] = { 0 };
+
     public:
         UserOutputs();
 
@@ -24,6 +28,10 @@ namespace Machine {
         void group(Configuration::HandlerBase& handler) override;
         bool setDigital(size_t io_num, bool isOn);
         bool setAnalogPercent(size_t io_num, float percent);
+
+        // Live state accessors for status reporting.
+        bool  getDigital(size_t io_num) const { return _digitalState[io_num]; }
+        float getAnalogPercent(size_t io_num) const { return _analogPercent[io_num]; }
 
         virtual ~UserOutputs();
     };

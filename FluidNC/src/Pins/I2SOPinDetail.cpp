@@ -24,6 +24,10 @@ namespace Pins {
                 _name += ":low";
             } else if (opt.is("high")) {
                 // Default: Active HIGH.
+            } else if (opt.is("report")) {
+                // Request that this user-I/O pin's state appear in the ? status report.
+                _reportInStatus = true;
+                _name += ":report";
             } else {
                 Assert(false, "Unsupported I2SO option '%.*s'", static_cast<int>(opt().length()), opt().data());
             }
