@@ -29,6 +29,18 @@
 #include <freertos/FreeRTOS.h>  // TickType_T
 #include <queue>
 
+// Optional CRC32 line integrity (for noisy USB links / robust senders).
+//   Off      - no framing; classic Grbl behavior (default, zero overhead).
+//   Optional - verify a "*<8 hex>" suffix when present; bare lines still accepted.
+//   Required - every inbound line must carry a valid "*<8 hex>" checksum.
+// When not Off, outbound lines are also framed with "*<8 hex>" so the sender can
+// verify responses.  Realtime characters are never framed (they bypass line assembly).
+enum class ChecksumMode : uint8_t {
+    Off      = 0,
+    Optional = 1,
+    Required = 2,
+};
+
 class Channel : public Stream {
 private:
     void pin_event(pinnum_t pinnum, bool active);
@@ -82,6 +94,13 @@ protected:
 
     bool _ended   = false;
     bool _percent = false;
+
+    ChecksumMode _checksumMode = ChecksumMode::Off;
+
+    // Verifies/strips a "*<8 hex>" CRC32 suffix on a just-assembled inbound line.
+    // Returns Error::Ok (line left ready to execute, suffix removed) or
+    // Error::BadGcodeChecksum.
+    Error verifyChecksum(char* line);
 
 protected:
     bool _active = true;
@@ -207,4 +226,7 @@ public:
 
     void pause();
     void resume();
+
+    void         setChecksumMode(ChecksumMode mode) { _checksumMode = mode; }
+    ChecksumMode checksumMode() const { return _checksumMode; }
 };

@@ -63,6 +63,9 @@ void setup() {
         log_info("Machine " << config->_name);
         log_info("Board " << config->_board);
 
+        // Apply optional CRC32 line integrity to the primary serial console.
+        Console.setChecksumMode(static_cast<ChecksumMode>(config->_checksum));
+
         // The initialization order reflects dependencies between the subsystems
         for (size_t i = 1; i < MAX_N_UARTS; i++) {
             if (config->_uarts[i]) {

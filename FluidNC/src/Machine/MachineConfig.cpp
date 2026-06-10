@@ -15,6 +15,7 @@
 
 #include "SettingsDefinitions.h"  // config_filename
 #include "FileStream.h"
+#include "EnumItem.h"  // checksumModes
 
 #include "Configuration/Parser.h"
 #include "Configuration/ParserHandler.h"
@@ -35,6 +36,8 @@ Machine::MachineConfig* config;
 // TODO FIXME: Split this file up into several files, perhaps put it in some folder and namespace Machine?
 
 namespace Machine {
+    const EnumItem checksumModes[] = { { 0, "off" }, { 1, "optional" }, { 2, "required" }, EnumItem(0) };
+
     void MachineConfig::group(Configuration::HandlerBase& handler) {
         handler.item("board", _board);
         handler.item("name", _name);
@@ -86,6 +89,7 @@ namespace Machine {
         handler.item("report_inches", _reportInches);
         handler.item("enable_parking_override_control", _enableParkingOverrideControl);
         handler.item("use_line_numbers", _useLineNumbers);
+        handler.item("checksum", _checksum, checksumModes);
         handler.item("planner_blocks", _planner_blocks, 10, 120);
     }
 

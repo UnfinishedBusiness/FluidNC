@@ -8,8 +8,13 @@
 #include "Limit.h"
 #include "Logging.h"
 #include "Job.h"
+#include "Crc32.h"  // crc32
 #include <string_view>
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 Channel::Channel(const std::string& name, bool addCR) : _name(name), _linelen(0), _addCR(addCR) {}
 Channel::Channel(const char* name, bool addCR) : _name(name), _linelen(0), _addCR(addCR) {}
@@ -208,6 +213,28 @@ void Channel::push(uint8_t byte) {
     }
 }
 
+static bool isHex8(const char* s) {
+    for (int i = 0; i < 8; ++i) {
+        if (!isxdigit((unsigned char)s[i])) {
+            return false;
+        }
+    }
+    return s[8] == '\0';
+}
+
+Error Channel::verifyChecksum(char* line) {
+    char* star        = strrchr(line, '*');
+    bool  hasChecksum = star && isHex8(star + 1);
+    if (!hasChecksum) {
+        // No well-formed checksum: accept in Optional mode, reject in Required mode.
+        return _checksumMode == ChecksumMode::Required ? Error::BadGcodeChecksum : Error::Ok;
+    }
+    uint32_t want = (uint32_t)strtoul(star + 1, nullptr, 16);
+    *star         = '\0';  // strip the suffix so execute_line sees clean gcode
+    uint32_t got  = crc32(line, strlen(line));
+    return got == want ? Error::Ok : Error::BadGcodeChecksum;
+}
+
 Error Channel::pollLine(char* line) {
     if (_paused) {
         return Error::Ok;
@@ -236,6 +263,13 @@ Error Channel::pollLine(char* line) {
         // Fall through if line is non-null and it is not a realtime character
 
         if (lineComplete(line, ch)) {
+            if (_checksumMode != ChecksumMode::Off) {
+                Error cs = verifyChecksum(line);
+                if (cs != Error::Ok) {
+                    ack(cs);               // emit error:N so the sender resends this line
+                    return Error::NoData;  // drop the corrupted line; do not execute it
+                }
+            }
             return Error::Ok;
         }
     }
@@ -283,6 +317,11 @@ void Channel::ack(Error status) {
 void Channel::print_msg(MsgLevel level, const char* msg) {
     if (_message_level >= level) {
         write(msg);
+        if (_checksumMode != ChecksumMode::Off) {
+            char suffix[10];
+            snprintf(suffix, sizeof(suffix), "*%08lX", (unsigned long)crc32(msg, strlen(msg)));
+            write(suffix);
+        }
         write("\n");
     }
 }

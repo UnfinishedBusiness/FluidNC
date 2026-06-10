@@ -94,6 +94,7 @@ enum class Error : uint8_t {
     FlowControlStackOverflow     = 179,
     ParameterAssignmentFailed    = 180,
     GcodeValueWordInvalid        = 181,
+    BadGcodeChecksum             = 182,  // Line checksum (CRC32) did not match; sender should resend
 };
 
 const char* errorString(Error errorNumber);

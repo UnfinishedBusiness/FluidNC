@@ -106,6 +106,10 @@ namespace Machine {
         // Tracks and reports gcode line numbers. Disabled by default.
         bool _useLineNumbers = false;
 
+        // CRC32 line-integrity on the primary serial console: 0=off, 1=optional, 2=required.
+        // Off by default, so existing setups are unchanged. See ChecksumMode in Channel.h.
+        uint32_t _checksum = 0;
+
         std::string _board = "None";
         std::string _name  = "None";
         std::string _meta  = "";

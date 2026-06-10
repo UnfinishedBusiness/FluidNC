@@ -89,4 +89,5 @@ const std::map<Error, const char*> ErrorNames = {
     { Error::FlowControlStackOverflow, "Flow Control Stack Overflow" },
     { Error::ParameterAssignmentFailed, "Parameter Assignment Failed" },
     { Error::GcodeValueWordInvalid, "Gcode invalid word value" },
+    { Error::BadGcodeChecksum, "Line checksum mismatch" },
 };
