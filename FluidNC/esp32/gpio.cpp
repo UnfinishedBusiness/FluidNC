@@ -112,10 +112,31 @@ static void gpios_update(gpio_mask_t& gpios, int32_t gpio_num, bool active) {
     }
 }
 
-static void* gpioArgs[MAX_N_GPIO + 1];
+// A single GPIO can drive more than one event handler so that one physical limit
+// switch wired to one input can serve several motors/axes (e.g. a shared homing
+// switch for a squared gantry).  Each gpio.N[:shared] declaration registers its
+// own handler here; on a change, every handler for that GPIO fires.
+static constexpr int MAX_GPIO_HANDLERS = 4;
+
+static void*   gpioArgs[MAX_N_GPIO + 1][MAX_GPIO_HANDLERS] = { { nullptr } };
+static uint8_t gpioArgCount[MAX_N_GPIO + 1]                = { 0 };
 
 void gpio_set_event(int32_t gpio_num, void* arg, bool invert) {
-    gpioArgs[gpio_num] = arg;
+    // Additive + de-duped: the owning declaration and any ":shared" ones each add their
+    // handler, independent of the order in which they are registered.
+    bool present = false;
+    for (int i = 0; i < gpioArgCount[gpio_num]; ++i) {
+        if (gpioArgs[gpio_num][i] == arg) {
+            present = true;
+            break;
+        }
+    }
+    if (!present) {
+        if (gpioArgCount[gpio_num] < MAX_GPIO_HANDLERS) {
+            gpioArgs[gpio_num][gpioArgCount[gpio_num]++] = arg;
+        }
+        // else: more than MAX_GPIO_HANDLERS handlers on one GPIO; the extra is ignored.
+    }
 
     gpios_update(gpios_interest, gpio_num, true);
     gpios_update(gpios_inverted, gpio_num, invert);
@@ -126,7 +147,7 @@ void gpio_set_event(int32_t gpio_num, void* arg, bool invert) {
     gpios_update(gpios_current, gpio_num, !active);
 }
 void gpio_clear_event(int32_t gpio_num) {
-    gpioArgs[gpio_num] = nullptr;
+    gpioArgCount[gpio_num] = 0;
     gpios_update(gpios_interest, gpio_num, false);
 }
 
@@ -134,9 +155,9 @@ static void gpio_send_initial_event(int32_t gpio_num) {
     if (gpios_interest & gpio_mask(gpio_num)) {
         bool active = gpio_is_active(gpio_num);
 
-        auto arg = gpioArgs[gpio_num];
-        if (arg) {
-            protocol_send_event(active ? &pinActiveEvent : &pinInactiveEvent, arg);
+        const Event* event = active ? &pinActiveEvent : &pinInactiveEvent;
+        for (int i = 0; i < gpioArgCount[gpio_num]; ++i) {
+            protocol_send_event(event, gpioArgs[gpio_num][i]);
         }
 
         gpios_update(gpios_current, gpio_num, active);
@@ -153,9 +174,9 @@ static void gpio_send_event(int32_t gpio_num, bool active) {
         }
         gpio_next_event_ticks[gpio_num] = end_ticks;
 
-        auto arg = gpioArgs[gpio_num];
-        if (arg) {
-            protocol_send_event_from_ISR(active ? &pinActiveEvent : &pinInactiveEvent, arg);
+        const Event* event = active ? &pinActiveEvent : &pinInactiveEvent;
+        for (int i = 0; i < gpioArgCount[gpio_num]; ++i) {
+            protocol_send_event_from_ISR(event, gpioArgs[gpio_num][i]);
         }
         gpios_update(gpios_current, gpio_num, active);
     }

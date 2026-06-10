@@ -15,6 +15,11 @@ namespace Pins {
 
         static std::vector<bool> _claimed;
 
+        // True for a ":shared" declaration: a second (or later) use of a GPIO that is
+        // already owned by a non-shared declaration.  Shared pins do not claim the GPIO
+        // and do not (re)configure its hardware mode; they only add an event handler.
+        bool _shared = false;
+
         bool _lastWrittenValue = false;
 
         PwmPin* _pwm;
@@ -43,6 +48,12 @@ namespace Pins {
 
         void registerEvent(InputPin* obj) override;
 
-        ~GPIOPinDetail() override { _claimed[_index] = false; }
+        // A shared declaration never claimed the GPIO, so it must not release the
+        // owner's claim when it is destroyed.
+        ~GPIOPinDetail() override {
+            if (!_shared) {
+                _claimed[_index] = false;
+            }
+        }
     };
 }

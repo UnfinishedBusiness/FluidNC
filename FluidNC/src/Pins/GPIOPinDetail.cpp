@@ -28,7 +28,8 @@ namespace Pins {
         Assert(index < MAX_N_GPIO, "Pin number is greater than max %d", MAX_N_GPIO - 1);
         Assert(_capabilities != PinCapabilities::Reserved, "Unusable GPIO");
         Assert(_capabilities != PinCapabilities::None, "Unavailable GPIO");
-        Assert(!_claimed[index], "Pin is already used");
+        // NOTE: the "already used" claim check is deferred until after option parsing
+        // so a ":shared" declaration can opt out of claiming (see below).
 
         _name = "gpio.";
         _name += std::to_string(_index);
@@ -67,6 +68,11 @@ namespace Pins {
             } else if (opt.is("ds3")) {
                 setDriveStrength(3, PinAttributes::DS3);
                 _name += ":ds3";
+            } else if (opt.is("shared")) {
+                // Allow this GPIO to be declared again for another motor's limit input.
+                // The first (non-shared) declaration owns the pin and configures it.
+                _shared = true;
+                _name += ":shared";
             } else {
                 Assert(false, "Bad GPIO option passed to pin %d: %.*s", int(index), static_cast<int>(opt().length()), opt().data());
             }
@@ -74,7 +80,14 @@ namespace Pins {
         if (_driveStrength != -1) {
             gpio_drive_strength(index, _driveStrength);
         }
-        _claimed[index] = true;
+
+        // A non-shared declaration is the owner: it claims the GPIO (and still catches
+        // accidental duplicate use).  A shared declaration deliberately does not claim,
+        // so it works regardless of whether it is parsed before or after its owner.
+        if (!_shared) {
+            Assert(!_claimed[index], "Pin is already used");
+            _claimed[index] = true;
+        }
 
         // readWriteMask is xor'ed with the value to invert it if active low
         _inverted = _attributes.has(PinAttributes::ActiveLow);
@@ -118,6 +131,13 @@ namespace Pins {
                name());
 
         _attributes = _attributes | value;
+
+        // A shared declaration must not touch the hardware: the owning (first, non-shared)
+        // declaration already set the GPIO's mode/pulls.  Reconfiguring here would clobber
+        // the owner's setup.  We still record _attributes above for this object's own use.
+        if (_shared) {
+            return;
+        }
 
         if (value.has(PinAttributes::PWM)) {
             _pwm = new PwmPin(_index, _attributes.has(PinAttributes::ActiveLow), frequency);
