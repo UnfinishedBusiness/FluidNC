@@ -1791,6 +1791,7 @@ Error gc_execute_line(const char* input_line) {
         auto const input_number = *maybe_input_number;
         auto const wait_mode    = *validate_wait_on_input_mode_value(gc_block.values.l);
         auto const timeout      = gc_block.values.q;
+        protocol_buffer_synchronize();  // read at this point in the program (synchronized with motion)
         gc_wait_on_input(isWaitOnInputDigital, input_number, wait_mode, timeout);
     }
 
@@ -2055,7 +2056,9 @@ static Error gc_wait_on_input(bool is_digital, objnum_t input_number, WaitOnInpu
             }
             result = (float)pin.get();
             set_numbered_param(5399, result);
-            log_debug("M66: " << pin.legend() << " result=" << result);
+            // Broadcast the result so a sender-side NGC engine can capture it into
+            // its own #5399 (mirrors how probing emits [PRB:...]).
+            log_stream(allChannels, "[AIR:P" << input_number << "=" << (int)result);
         } else {
             if (input_number >= MaxUserAnalogPin) {
                 return Error::PParamMaxExceeded;
@@ -2065,9 +2068,9 @@ static Error gc_wait_on_input(bool is_digital, objnum_t input_number, WaitOnInpu
                 log_error(pin.legend() << " is not defined");
                 return Error::PParamMaxExceeded;
             }
-            result = (float)pin.get();
+            result = config->_userInputs->readAnalog(input_number);  // scaled engineering units
             set_numbered_param(5399, result);
-            log_debug("M66: " << pin.legend() << " result=" << result);
+            log_stream(allChannels, "[AIR:E" << input_number << "=" << result);
         }
 
         return Error::Ok;

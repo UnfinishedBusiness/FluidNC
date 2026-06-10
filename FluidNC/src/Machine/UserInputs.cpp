@@ -3,8 +3,17 @@
 
 #include "UserInputs.h"
 
+#ifdef __FLUIDNC
+#    include <Arduino.h>  // analogReadMilliVolts
+#endif
+
 namespace Machine {
-    UserInputs::UserInputs() {}
+    UserInputs::UserInputs() {
+        for (size_t i = 0; i < MaxUserAnalogPin; i++) {
+            _analogScale[i]  = 1.0f;
+            _analogOffset[i] = 0.0f;
+        }
+    }
     UserInputs::~UserInputs() {}
 
     // clang-format off
@@ -35,6 +44,30 @@ namespace Machine {
             auto& pin = analogInput[i];
             handler.item(pin.legend(), pin);
         }
+        handler.item("analog0_scale", _analogScale[0]);
+        handler.item("analog1_scale", _analogScale[1]);
+        handler.item("analog2_scale", _analogScale[2]);
+        handler.item("analog3_scale", _analogScale[3]);
+        handler.item("analog0_offset", _analogOffset[0]);
+        handler.item("analog1_offset", _analogOffset[1]);
+        handler.item("analog2_offset", _analogOffset[2]);
+        handler.item("analog3_offset", _analogOffset[3]);
+    }
+
+    float UserInputs::readAnalog(size_t i) {
+        if (i >= MaxUserAnalogPin) {
+            return 0.0f;
+        }
+        auto& pin = analogInput[i];
+        if (pin.undefined()) {
+            return 0.0f;
+        }
+        float volts = 0.0f;
+#ifdef __FLUIDNC
+        pinnum_t gpio = pin.getNative(Pin::Capabilities::ADC);
+        volts         = analogReadMilliVolts((uint8_t)gpio) * 0.001f;
+#endif
+        return volts * _analogScale[i] + _analogOffset[i];
     }
 
     void UserInputs::init() {

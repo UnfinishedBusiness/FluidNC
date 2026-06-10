@@ -505,6 +505,14 @@ static std::string report_user_io_string() {
         s += '=';
         s += std::to_string(val);
     };
+    auto appendFloat = [&](const char* type, size_t i, float val) {
+        if (!s.empty()) {
+            s += ',';
+        }
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%s%u=%.3f", type, (unsigned)i, val);
+        s += buf;
+    };
 
     if (auto* out = config->_userOutputs) {
         for (size_t i = 0; i < MaxUserDigitalPin; i++) {
@@ -527,7 +535,7 @@ static std::string report_user_io_string() {
     for (size_t i = 0; i < MaxUserAnalogPin; i++) {
         auto& pin = Machine::UserInputs::analogInput[i];
         if (pin.defined() && pin.reportInStatus()) {
-            append("AI", i, pin.get() ? 1 : 0);
+            appendFloat("AI", i, config->_userInputs->readAnalog(i));  // scaled engineering units
         }
     }
     return s;

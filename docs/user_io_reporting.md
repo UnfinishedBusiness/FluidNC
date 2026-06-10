@@ -36,7 +36,7 @@ Each entry is `<type><index>=<value>`:
 | `DO` | digital output | `M62`/`M63`/`M64`/`M65` | `0` / `1` |
 | `AO` | analog output | `M67`/`M68` | commanded percent `0`–`100` |
 | `DI` | digital input | `M66 P` | `0` / `1` |
-| `AI` | analog input | `M66 E` | `0` / `1` (see limitation) |
+| `AI` | analog input | `M66 E` | scaled value (see [m66_analog_input.md](m66_analog_input.md)) |
 
 Only flagged pins appear; the field is omitted entirely when none are flagged. The
 index matches the config pin number (`digital0_pin` → `DO0`/`DI0`,
@@ -52,10 +52,9 @@ reflect the live pin).
 
 ## Limitations / notes
 
-- **Analog input is boolean for now.** FluidNC currently reads analog input pins as
-  digital, so `AI<n>` reports `0`/`1`. Reading a true analog value is a separate,
-  upcoming change; once it lands, `AI<n>` can carry a numeric value. `AO<n>`
-  (commanded percent) is already a real value.
+- **Analog input** (`AI<n>`) reports a real, scaled value (volts × `analogN_scale` +
+  `analogN_offset`), the same reading `M66 E<n>` returns — see
+  [m66_analog_input.md](m66_analog_input.md). Use an ADC1 GPIO so it coexists with WiFi.
 - **`:report` is meaningful only on user-I/O pins.** It is accepted (and ignored) on
   other pins.
 - **Latency** is the sender's poll interval. A future enhancement could push an

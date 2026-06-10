@@ -34,3 +34,9 @@ user_outputs:
 
 user_inputs:
   digital0_pin: gpio.34:report      # e.g. material-present sensor -> reports DI0 (M66 P0)
+
+  # Analog input read by M66 E0 (-> #5399, broadcast as [AIR:E0=..]) and, with :report,
+  # shown live as |UIO:AI0=.. .  Value = pin_volts * scale + offset.  Use an ADC1 GPIO.
+  analog0_pin:    gpio.36:report
+  analog0_scale:  230.0
+  analog0_offset: 0.0
