@@ -1,0 +1,105 @@
+board: ESP32 Dev
+name: Squared gantry with shared limit pins
+
+# ---------------------------------------------------------------------------
+# Shared limit-pin example (gantry squaring with only two limit inputs)
+# ---------------------------------------------------------------------------
+# A two-motor (squared) gantry normally needs a separate home switch input for
+# each of X, Y1, Y2 and Z.  This board only has two free inputs, so the switches
+# are paired onto them:
+#
+#     GPIO 13  <--  X home switch  AND  Y1 (left)  home switch
+#     GPIO  5  <--  Z home switch  AND  Y2 (right) home switch
+#
+# Each GPIO is declared once as the owner (plain `gpio.N`) and again for the
+# second motor with the `:shared` attribute (`gpio.N:shared`).  When the input
+# fires, BOTH motors' limits trigger.  Full explanation: ../docs/shared_limit_pins.md
+#
+# IMPORTANT WIRING/HOMING RULES (see the doc for the full explanation):
+#   * Wire paired switches with the SAME polarity (here both active-low, `:low`):
+#     a GPIO has a single inversion, shared by all its handlers.
+#   * Axes that share an input must home in SEPARATE homing cycles, so only one
+#     of them is moving toward the shared switch at a time.  Here: Z=cycle 1,
+#     X=cycle 2, Y=cycle 3.  The two Y motors home together in cycle 3 (that is
+#     how the gantry squares) because Y1 and Y2 are on *different* inputs.
+# ---------------------------------------------------------------------------
+
+stepping:
+  engine: RMT
+  idle_ms: 250
+  pulse_us: 4
+  dir_delay_us: 1
+  disable_delay_us: 0
+
+axes:
+  shared_stepper_disable_pin: gpio.25
+
+  x:
+    steps_per_mm: 200.000
+    max_rate_mm_per_min: 10000.000
+    acceleration_mm_per_sec2: 300.000
+    max_travel_mm: 1500.000
+    soft_limits: true
+    homing:
+      cycle: 2                      # homes alone (shares GPIO 13 with Y1)
+      positive_direction: false
+      mpos_mm: 0.000
+      feed_mm_per_min: 300.000
+      seek_mm_per_min: 2000.000
+      settle_ms: 250
+    motor0:
+      limit_all_pin: gpio.13:low    # owner of GPIO 13
+      hard_limits: true
+      pulloff_mm: 2.000
+      standard_stepper:
+        step_pin: gpio.12
+        direction_pin: gpio.14
+
+  y:
+    steps_per_mm: 200.000
+    max_rate_mm_per_min: 10000.000
+    acceleration_mm_per_sec2: 300.000
+    max_travel_mm: 3000.000
+    soft_limits: true
+    homing:
+      cycle: 3                      # homes alone; both Y motors square together
+      positive_direction: false
+      mpos_mm: 0.000
+      feed_mm_per_min: 300.000
+      seek_mm_per_min: 2000.000
+      settle_ms: 250
+    motor0:                         # Y1 (left) -- shares GPIO 13 with X
+      limit_all_pin: gpio.13:low:shared
+      hard_limits: true
+      pulloff_mm: 2.000
+      standard_stepper:
+        step_pin: gpio.27
+        direction_pin: gpio.26
+    motor1:                         # Y2 (right) -- shares GPIO 5 with Z
+      limit_all_pin: gpio.5:low:shared
+      hard_limits: true
+      pulloff_mm: 2.000
+      standard_stepper:
+        step_pin: gpio.33
+        direction_pin: gpio.32
+
+  z:
+    steps_per_mm: 200.000
+    max_rate_mm_per_min: 3000.000
+    acceleration_mm_per_sec2: 100.000
+    max_travel_mm: 150.000
+    soft_limits: true
+    homing:
+      cycle: 1                      # homes first, alone (shares GPIO 5 with Y2)
+      positive_direction: true
+      mpos_mm: 0.000
+      feed_mm_per_min: 300.000
+      seek_mm_per_min: 1000.000
+      settle_ms: 250
+    motor0:
+      limit_all_pin: gpio.5:low     # owner of GPIO 5
+      hard_limits: true
+      pulloff_mm: 2.000
+      standard_stepper:
+        step_pin: gpio.15
+        direction_pin: gpio.2
