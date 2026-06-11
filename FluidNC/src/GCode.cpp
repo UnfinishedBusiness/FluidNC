@@ -11,6 +11,8 @@
 #include "Report.h"
 #include "Jog.h"
 #include "Protocol.h"             // protocol_buffer_synchronize
+#include "Planner.h"              // plan_sync_position
+#include "NutsBolts.h"            // delay_ms
 #include "MotionControl.h"        // mc_override_ctrl_update
 #include "Machine/UserOutputs.h"  // setAnalogPercent
 #include "Machine/UserInputs.h"   // read digital/analog inputs
@@ -1827,6 +1829,15 @@ Error gc_execute_line(const char* input_line) {
             case ThcControl::Disable:
                 protocol_buffer_synchronize();
                 config->_thc->disable();
+                // The THC service runs at 1 kHz and the step ticker at 8 kHz; give both
+                // time to see _enabled=false and quiesce before re-syncing position.
+                delay_ms(2);
+                // pl.position only tracks G-code commanded steps — THC-injected corrections
+                // are invisible to it.  Re-sync from axis_steps so the next planned move
+                // (e.g. G53 G0 Z0 in torch_off) starts from the physically correct position
+                // and doesn't overshoot by the accumulated THC offset.
+                plan_sync_position();
+                gc_sync_position();
                 break;
             case ThcControl::SetVoltage:
                 config->_thc->setTargetVoltage(gc_block.values.q);
