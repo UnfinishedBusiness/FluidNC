@@ -1105,11 +1105,10 @@ Error gc_execute_line(const char* input_line) {
         //  - Ignored if L is 0 (Immediate).
         //  - Error if value 0 seconds, and L is not 0 (Immediate).
         if (bitnum_is_true(value_words, GCodeWord::Q)) {
-            if (gc_block.values.q != 0.0) {
-                if (wait_mode != WaitOnInputMode::Immediate) {
-                    // Non-immediate waits must have a non-zero timeout
-                    return Error::GcodeValueWordInvalid;
-                }
+            // Q present: a non-immediate (blocking) wait requires a NON-ZERO timeout. Q==0 with L!=0 is invalid;
+            // a non-zero Q with a non-immediate L (e.g. `M66 P1 L3 Q5`) is the normal blocking-read form.
+            if (gc_block.values.q == 0.0 && wait_mode != WaitOnInputMode::Immediate) {
+                return Error::GcodeValueWordInvalid;
             }
         } else {
             if (wait_mode != WaitOnInputMode::Immediate) {
