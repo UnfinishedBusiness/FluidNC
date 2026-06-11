@@ -81,11 +81,36 @@ lower it.
 ## Status reporting
 
 When `thc:` is present, **every** `?` status report carries an arc field so a sender
-can drive a live DRO / arc-OK indicator:
+can drive a live DRO and AVTHC indicators:
 
 ```
-|Arc:<volts>,<arc_ok 0|1>,<active 0|1>
+|Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>
 ```
+
+| idx | field   | type        | meaning |
+|-----|---------|-------------|---------|
+| 0   | voltage | float (1dp) | measured arc voltage (scaled engineering volts) |
+| 1   | arc_ok  | `0`/`1`     | arc-OK input asserted |
+| 2   | active  | `0`/`1`     | THC is **currently correcting Z** (all control gates passed) |
+| 3   | target  | float (1dp) | **set target voltage** (`M103 Q`; `0` until set) |
+| 4   | enabled | `0`/`1`     | **AVTHC armed** (`M101`=1 / `M102`=0) |
+
+Example: `|Arc:123.4,1,1,120.0,1`.
+
+**`enabled` vs `active`:** `enabled` is the operator's intent (armed via `M101`); `active`
+is true only while the loop is *actually moving Z* (enabled **and** arc-OK **and** past the
+stabilization delay **and** not in anti-dive **and** outside the deadband). So a torch can be
+`enabled=1, active=0` (armed but idle). Drive an "AVTHC ON" indicator off `enabled` and an
+"adjusting" cue off `active`.
+
+**`target` vs `min_arc_voltage`:** a `target` at or below the configured `min_arc_voltage`
+means correction is effectively off even when `enabled=1` (the firmware's THC-OFF floor).
+
+### Sender mapping
+
+Parse the `|Arc:` CSV → `{ voltage, arcOk, active, target, enabled }`. Positions 0-2 are
+unchanged from earlier firmware, and 3-4 are additive — a 3-field `|Arc:` from an older build
+still parses (treat missing `target` as unset and `enabled` as `0`).
 
 ## Z motion injection — requirements
 

@@ -217,9 +217,13 @@ namespace Machine {
 
     // ------------------------------- reporting -------------------------------
 
+    // |Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>
+    //   voltage = measured arc volts; arc_ok = arc-OK input; active = currently correcting Z;
+    //   target  = set target volts (M103 Q); enabled = armed (M101=1 / M102=0).
     void THC::status_report(LogStream& msg) {
         msg << "|Arc:" << setprecision(1) << _arc_volts.load() << "," << (_arc_ok.load() ? 1 : 0) << ","
-            << (_active.load() ? 1 : 0);
+            << (_active.load() ? 1 : 0) << "," << setprecision(1) << _target_volts.load() << ","
+            << (_enabled.load() ? 1 : 0);
     }
 
 #ifdef __FLUIDNC
