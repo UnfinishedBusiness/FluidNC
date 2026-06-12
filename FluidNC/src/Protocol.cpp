@@ -897,7 +897,9 @@ void protocol_exec_rt_system() {
 
 #ifdef ENABLE_FW_JOG
     // Self-refilling jog feed: top up the planner queue in the main loop (never an ISR).
-    if (config->_jogging) {
+    // `config` is still null very early in setup() (make_coordinates() -> buffer_synchronize()
+    // -> here runs before config->load()), so guard the pointer itself, not just the member.
+    if (config && config->_jogging) {
         config->_jogging->refill();
     }
 #endif
