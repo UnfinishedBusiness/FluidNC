@@ -54,6 +54,19 @@ namespace Machine {
             return v / MM_MIN_TO_MM_S;
         }
 
+        // Clamp `feed` (mm/min) so no active axis exceeds its per-axis max_rate when the jog
+        // runs along the unit vector `dir` (XYZ): feed_max = min over active axes of
+        // (max_rate[a] / |dir[a]|). Axes with dir==0 or max_rate<=0 are ignored.
+        inline float clamp_feed_to_axis_rates(float feed_mm_min, const float dir[3], const float max_rate_mm_min[3]) {
+            for (int a = 0; a < 3; ++a) {
+                float d = std::fabs(dir[a]);
+                if (d > 0.0f && max_rate_mm_min[a] > 0.0f) {
+                    feed_mm_min = std::min(feed_mm_min, max_rate_mm_min[a] / d);
+                }
+            }
+            return feed_mm_min;
+        }
+
         // The feed the machine actually executes for a given queued runway: the cruise feed,
         // unless the runway is too short to hold it (then decel-limited). The flat-velocity
         // invariant is exactly "keep runway >= braking distance => this stays == cruise".

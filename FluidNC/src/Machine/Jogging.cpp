@@ -66,15 +66,14 @@ namespace Machine {
     float Jogging::effectiveCruise() const {
         // Clamp the requested cruise so no active axis exceeds its max_rate along the vector,
         // then apply the unhomed feed cap when any axis is unhomed.
-        float cruise = _cruise_mm_min;
-        auto  axes   = config->_axes;
+        float maxRate[3] = { 0, 0, 0 };
+        auto  axes       = config->_axes;
         for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-            float d = std::fabs(_dirUnit[a]);
-            if (d > 0.0f && axes->_axis[a]) {
-                float axisCap = axes->_axis[a]->_maxRate / d;  // mm/min
-                cruise        = std::min(cruise, axisCap);
+            if (axes->_axis[a]) {
+                maxRate[a] = axes->_axis[a]->_maxRate;
             }
         }
+        float cruise = JogMath::clamp_feed_to_axis_rates(_cruise_mm_min, _dirUnit, maxRate);
         if (anyAxisUnhomed() && _unhomed_feed_cap_mm_min > 0) {
             cruise = std::min(cruise, float(_unhomed_feed_cap_mm_min));
         }
@@ -98,6 +97,13 @@ namespace Machine {
 
         if (_phase == Phase::Idle) {
             _entryUnhomed = unhomedCarveout;
+            if (unhomedCarveout) {
+                // Permit motion from Alarm:Unhomed WITHOUT clearing the unhomed flags (unlike $X,
+                // which calls set_all_axes_homed()). Drop to Idle so cycle-start can run; the jog
+                // end restores Alarm:Unhomed. The unhomed feed cap is the only protection while
+                // unhomed. (Runtime-validated on hardware; see docs/jogging.md.)
+                set_state(State::Idle);
+            }
         }
         _phase = Phase::Jogging;
         refill();
@@ -119,6 +125,10 @@ namespace Machine {
                 protocol_do_motion_cancel();  // flush queued jog + decel in place (the JogCancel path)
             } else {
                 _phase = Phase::Idle;
+                if (_entryUnhomed) {  // cancelled before motion started -> restore the alarm
+                    _entryUnhomed = false;
+                    send_alarm(ExecAlarm::Unhomed);
+                }
             }
         }
         return Error::Ok;
@@ -131,9 +141,15 @@ namespace Machine {
 
     void Jogging::refill() {
         if (_phase != Phase::Jogging) {
-            // When the cancel/decel has finished and we are back to Idle, clear our phase.
+            // When the cancel/decel has finished and we are back to Idle, finish up.
             if (_phase == Phase::Stopping && (state_is(State::Idle) || state_is(State::Alarm))) {
                 _phase = Phase::Idle;
+                // Unhomed round-trip: a jog that started from Alarm:Unhomed returns there (NOT Idle)
+                // so program-start homing enforcement and the host's homing badge stay truthful.
+                if (_entryUnhomed && state_is(State::Idle)) {
+                    _entryUnhomed = false;
+                    send_alarm(ExecAlarm::Unhomed);
+                }
             }
             return;
         }

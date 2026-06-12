@@ -113,6 +113,19 @@ TEST(JogMath, MaxFeedAtBrakingDistanceEqualsCruise) {
     EXPECT_NEAR(max_feed_for_runway_mm_min(brake, 500.0f), 3000.0f, 1.0f);
 }
 
+TEST(JogMath, ClampFeedToAxisRates) {
+    // 45deg XY move: dir = (0.707, 0.707, 0); X max 5000, Y max 3000.
+    // cap = min(5000/0.707, 3000/0.707) = 4243; requested 6000 -> 4243.
+    float dir[3]  = { 0.70710678f, 0.70710678f, 0.0f };
+    float rate[3] = { 5000.0f, 3000.0f, 0.0f };
+    EXPECT_NEAR(clamp_feed_to_axis_rates(6000.0f, dir, rate), 3000.0f / 0.70710678f, 1.0f);
+    // Single-axis move is capped at that axis rate, not below.
+    float dx[3] = { 1.0f, 0.0f, 0.0f };
+    EXPECT_NEAR(clamp_feed_to_axis_rates(6000.0f, dx, rate), 5000.0f, 1e-3f);
+    // Requested below the cap passes through.
+    EXPECT_NEAR(clamp_feed_to_axis_rates(1000.0f, dir, rate), 1000.0f, 1e-3f);
+}
+
 TEST(JogMath, ExecutingFeedDecelLimitedWhenRunwayShort) {
     // runway below braking distance -> decel-limited below cruise
     EXPECT_LT(executing_feed_mm_min(1.0f, 3000.0f, 500.0f), 3000.0f);
