@@ -185,6 +185,12 @@ void report_init_message(Channel& channel) {
         }
     }
     // When msg goes out of scope, the destructor will send the line
+
+#ifdef ENABLE_FW_JOG
+    // Advertise the firmware-native jog/shuttle engines on the boot banner too, so a sender can
+    // feature-detect without issuing $I.
+    log_stream(channel, "[CAP:FWJOG=1,FWSHU=1]");
+#endif
 }
 
 // Prints current probe parameters. Upon a probe command, these parameters are updated upon a
@@ -403,6 +409,12 @@ void report_build_info(const char* line, Channel& channel) {
     for (auto const& module : Modules()) {
         module->build_info(channel);
     }
+
+#ifdef ENABLE_FW_JOG
+    // Firmware-native jogging/shuttle capability advertisement (see plans/firmware-jogging).
+    // Lets a sender feature-detect the $Jog/* and $Shu/* engines instead of probing.
+    log_stream(channel, "[CAP:FWJOG=1,FWSHU=1]");
+#endif
 }
 
 // Prints the character string line that was received, which has been pre-parsed,
