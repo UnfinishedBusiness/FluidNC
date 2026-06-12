@@ -51,6 +51,8 @@ extern volatile bool rtCycleStop;
 
 extern volatile bool runLimitLoop;
 
+extern volatile ExecAlarm lastAlarm;  // most recent alarm code (e.g. for the unhomed jog carve-out)
+
 #include <map>
 extern const std::map<ExecAlarm, const char*> AlarmNames;
 

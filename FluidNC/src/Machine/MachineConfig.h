@@ -30,6 +30,9 @@
 #include "UserOutputs.h"
 #include "UserInputs.h"
 #include "THC.h"
+#ifdef ENABLE_FW_JOG
+#    include "Jogging.h"
+#endif
 #include "Macros.h"
 
 #include <string_view>
@@ -80,6 +83,9 @@ namespace Machine {
         UserOutputs*    _userOutputs = nullptr;
         UserInputs*     _userInputs  = nullptr;
         THC*            _thc         = nullptr;  // null unless a `thc:` section is present
+#ifdef ENABLE_FW_JOG
+        Jogging*        _jogging     = nullptr;  // firmware-native jogging (noradio builds only)
+#endif
         SDCard*         _sdCard      = nullptr;
         Macros*         _macros      = nullptr;
         Start*          _start       = nullptr;

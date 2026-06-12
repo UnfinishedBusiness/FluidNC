@@ -131,6 +131,12 @@ void setup() {
             config->_thc->init();  // plasma Torch Height Control (after Stepping/Axes are up)
         }
 
+#ifdef ENABLE_FW_JOG
+        if (config->_jogging) {
+            config->_jogging->init();  // firmware-native jogging engine
+        }
+#endif
+
         limits_init();
 
         // Initialize system state.

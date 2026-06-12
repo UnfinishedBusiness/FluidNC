@@ -895,6 +895,13 @@ void protocol_exec_rt_system() {
 
     protocol_handle_events();
 
+#ifdef ENABLE_FW_JOG
+    // Self-refilling jog feed: top up the planner queue in the main loop (never an ISR).
+    if (config->_jogging) {
+        config->_jogging->refill();
+    }
+#endif
+
     // Reload step segment buffer
     switch (sys.state()) {
         case State::ConfigAlarm:

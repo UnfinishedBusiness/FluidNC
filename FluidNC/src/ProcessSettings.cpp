@@ -1003,6 +1003,33 @@ static Error list_parameters(const char* value, AuthenticationLevel auth_level, 
     return Error::Ok;
 }
 
+#ifdef ENABLE_FW_JOG
+#    include "Machine/JogCommand.h"
+static Error fwJogStart(const char* value, AuthenticationLevel, Channel& out) {
+    if (!config->_jogging) {
+        return Error::InvalidStatement;
+    }
+    Machine::JogCommand::Vector v;
+    if (!value || !Machine::JogCommand::parse_vector(value, v)) {
+        return Error::InvalidStatement;  // error:3, malformed vector/feed
+    }
+    return config->_jogging->startVector(v, out);
+}
+static Error fwJogFeed(const char* value, AuthenticationLevel, Channel& out) {
+    float f;
+    if (!config->_jogging || !value || !Machine::JogCommand::parse_feed(value, f)) {
+        return Error::InvalidStatement;
+    }
+    return config->_jogging->changeFeed(f, out);
+}
+static Error fwJogStop(const char* value, AuthenticationLevel, Channel& out) {
+    if (!config->_jogging) {
+        return Error::InvalidStatement;
+    }
+    return config->_jogging->stop(out);
+}
+#endif
+
 // Commands use the same syntax as Settings, but instead of setting or
 // displaying a persistent value, a command causes some action to occur.
 // That action could be anything, from displaying a run-time parameter
@@ -1082,6 +1109,11 @@ void make_user_commands() {
     new UserCommand("GS", "GRBL/Show", report_init_message_cmd, notIdleOrAlarm);
 
     new AsyncUserCommand("J", "Jog", doJog, notIdleOrJog);
+#ifdef ENABLE_FW_JOG
+    new UserCommand("JGS", "Jog/Start", fwJogStart, anyState);
+    new UserCommand("JGF", "Jog/Feed", fwJogFeed, anyState);
+    new UserCommand("JGX", "Jog/Stop", fwJogStop, anyState);
+#endif
     new AsyncUserCommand("G", "GCode/Modes", report_gcode, anyState);
 };
 

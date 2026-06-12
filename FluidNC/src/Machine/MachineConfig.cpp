@@ -81,6 +81,12 @@ namespace Machine {
         // configs are unaffected.
         handler.section("thc", _thc);
 
+#ifdef ENABLE_FW_JOG
+        // Firmware-native jogging.  Compiled only into noradio builds; the module still
+        // advertises capability with a default (absent) config.
+        handler.section("jogging", _jogging);
+#endif
+
         ConfigurableModuleFactory::factory(handler);
         ATCs::ATCFactory::factory(handler);
         Spindles::SpindleFactory::factory(handler);
@@ -122,6 +128,14 @@ namespace Machine {
         if (_userInputs == nullptr) {
             _userInputs = new UserInputs();
         }
+
+#ifdef ENABLE_FW_JOG
+        // Always present (with defaults) when compiled in, so capability is advertised and
+        // jogging works even without an explicit `jogging:` section.
+        if (_jogging == nullptr) {
+            _jogging = new Jogging();
+        }
+#endif
 
 #if MAX_N_SDCARD
         if (_sdCard == nullptr) {
