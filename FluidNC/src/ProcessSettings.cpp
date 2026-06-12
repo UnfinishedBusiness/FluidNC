@@ -1028,6 +1028,37 @@ static Error fwJogStop(const char* value, AuthenticationLevel, Channel& out) {
     }
     return config->_jogging->stop(out);
 }
+static Error fwShuBegin(const char* value, AuthenticationLevel, Channel& out) {
+    if (!config->_jogging || !value) {
+        return Error::InvalidStatement;
+    }
+    char* end   = nullptr;
+    long  total = strtol(value, &end, 10);
+    if (end == value) {
+        return Error::InvalidStatement;  // error:3
+    }
+    return config->_jogging->shuttleBegin(static_cast<int>(total), out);
+}
+static Error fwShuData(const char* value, AuthenticationLevel, Channel& out) {
+    if (!config->_jogging || !value) {
+        return Error::InvalidStatement;
+    }
+    return config->_jogging->shuttleData(value, out);
+}
+static Error fwShuJog(const char* value, AuthenticationLevel, Channel& out) {
+    int8_t dir;
+    float  feed = 0.0f;
+    if (!config->_jogging || !value || !Machine::JogCommand::parse_shuttle(value, dir, feed)) {
+        return Error::InvalidStatement;  // error:3
+    }
+    return config->_jogging->shuttleJog(dir, feed, out);
+}
+static Error fwShuEnd(const char* value, AuthenticationLevel, Channel& out) {
+    if (!config->_jogging) {
+        return Error::InvalidStatement;
+    }
+    return config->_jogging->shuttleEnd(out);
+}
 #endif
 
 // Commands use the same syntax as Settings, but instead of setting or
@@ -1113,6 +1144,10 @@ void make_user_commands() {
     new UserCommand("JGS", "Jog/Start", fwJogStart, anyState);
     new UserCommand("JGF", "Jog/Feed", fwJogFeed, anyState);
     new UserCommand("JGX", "Jog/Stop", fwJogStop, anyState);
+    new UserCommand("SHB", "Shu/Begin", fwShuBegin, anyState);
+    new UserCommand("SHD", "Shu/Data", fwShuData, anyState);
+    new UserCommand("SHJ", "Shu/Jog", fwShuJog, anyState);
+    new UserCommand("SHE", "Shu/End", fwShuEnd, anyState);
 #endif
     new AsyncUserCommand("G", "GCode/Modes", report_gcode, anyState);
 };

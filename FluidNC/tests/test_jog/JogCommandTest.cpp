@@ -69,3 +69,26 @@ TEST(Shuttle, RejectsBad) {
     EXPECT_FALSE(parse_shuttle("1 F0", d, f));   // non-positive feed
     EXPECT_FALSE(parse_shuttle("", d, f));
 }
+
+TEST(ShuttleData, ParsesVerticesAtAbsoluteIndex) {
+    ShuttleVertex v[8];
+    int           first = -1;
+    int           n     = parse_shuttle_data("12:1.5,2.0;3.25,-4.5;0,0", first, v, 8);
+    ASSERT_EQ(n, 3);
+    EXPECT_EQ(first, 12);
+    EXPECT_FLOAT_EQ(v[0].x, 1.5f);
+    EXPECT_FLOAT_EQ(v[0].y, 2.0f);
+    EXPECT_FLOAT_EQ(v[1].x, 3.25f);
+    EXPECT_FLOAT_EQ(v[1].y, -4.5f);
+    EXPECT_FLOAT_EQ(v[2].x, 0.0f);
+}
+
+TEST(ShuttleData, RejectsMalformedAndOverflow) {
+    ShuttleVertex v[2];
+    int           first;
+    EXPECT_EQ(parse_shuttle_data("5 1,2", first, v, 2), -1);     // missing colon
+    EXPECT_EQ(parse_shuttle_data("5:1", first, v, 2), -1);       // missing y
+    EXPECT_EQ(parse_shuttle_data("5:1,2;3,x", first, v, 2), -1); // bad number
+    EXPECT_EQ(parse_shuttle_data("5:1,2;3,4;5,6", first, v, 2), -1); // overflow maxN=2
+    EXPECT_EQ(parse_shuttle_data(":1,2", first, v, 2), -1);      // missing index
+}

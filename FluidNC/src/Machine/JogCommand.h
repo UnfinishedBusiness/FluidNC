@@ -82,6 +82,55 @@ namespace Machine {
             return true;
         }
 
+        struct ShuttleVertex {
+            float x;
+            float y;
+        };
+
+        // Parse `$Shu/Data=` body "<firstIdx>:x,y;x,y;..." (mm). Writes firstIdx and up to
+        // maxN vertices into `out`; returns the vertex count, or -1 on any malformed field /
+        // overflow. Trailing whitespace is tolerated.
+        inline int parse_shuttle_data(const char* s, int& firstIdx, ShuttleVertex* out, int maxN) {
+            char* end = nullptr;
+            long  fi  = strtol(s, &end, 10);
+            if (end == s || *end != ':') {
+                return -1;
+            }
+            firstIdx      = static_cast<int>(fi);
+            const char* p = end + 1;
+            int         n = 0;
+            while (*p && *p != '\n' && *p != '\r') {
+                if (n >= maxN) {
+                    return -1;  // chunk overflow
+                }
+                float x = strtof(p, &end);
+                if (end == p || *end != ',') {
+                    return -1;
+                }
+                p       = end + 1;
+                float y = strtof(p, &end);
+                if (end == p) {
+                    return -1;
+                }
+                p          = end;
+                out[n].x   = x;
+                out[n].y   = y;
+                ++n;
+                if (*p == ';') {
+                    ++p;
+                    continue;
+                }
+                while (*p == ' ' || *p == '\t') {
+                    ++p;
+                }
+                if (*p == '\0' || *p == '\n' || *p == '\r') {
+                    break;
+                }
+                return -1;  // junk between/after pairs
+            }
+            return n;
+        }
+
         // Parse a shuttle direction command "<+1|-1|0> F<mm/min>" for `$Shu/Jog=`.
         inline bool parse_shuttle(const char* s, int8_t& dir, float& feed) {
             char* end = nullptr;

@@ -5,10 +5,12 @@
 
 #include "Configuration/Configurable.h"
 #include "JogCommand.h"
+#include "ShuttlePath.h"
 #include "../Error.h"
 #include "../Config.h"  // MAX_N_AXIS
 
 class Channel;
+class LogStream;
 
 namespace Machine {
 
@@ -32,6 +34,16 @@ namespace Machine {
         Error changeFeed(float feed_mm_min, Channel& out);
         Error stop(Channel& out);
 
+        // $Shu/* command entry points (path-window shuttle mode).
+        Error shuttleBegin(int total, Channel& out);
+        Error shuttleData(const char* body, Channel& out);
+        Error shuttleJog(int8_t dir, float feed_mm_min, Channel& out);
+        Error shuttleEnd(Channel& out);
+
+        // Append the |Shu:<vidx>,<s_mm> status field when a shuttle session is open.
+        void status_report(LogStream& msg);
+        bool shuttleSession() const { return _shuttleOpen; }
+
         // Called from protocol_exec_rt_system (main loop, NOT an ISR) to top up the queue.
         void refill();
 
@@ -42,12 +54,23 @@ namespace Machine {
 
     private:
         enum class Phase { Idle, Jogging, Stopping };
+        enum class Kind { Vector, Shuttle };
 
         Phase  _phase            = Phase::Idle;
+        Kind   _kind             = Kind::Vector;
         int8_t _vec[3]           = { 0, 0, 0 };
         float  _dirUnit[3]       = { 0, 0, 0 };  // normalized jog vector (XYZ)
         float  _cruise_mm_min    = 0.0f;         // requested cruise (pre per-axis clamp)
         bool   _entryUnhomed     = false;        // started from Alarm:Unhomed -> return there on stop
+
+        // Shuttle (path-window) state.
+        ShuttlePath      _path;
+        ShuttlePath::Pos _cmdPos;                 // commanded position along the path
+        bool             _shuttleOpen  = false;   // session open (Begin..End)
+        int8_t           _shuttleDir   = 0;       // held direction (+1/-1/0=release)
+        int8_t           _pendingDir   = 0;       // direction to resume after a reversal stop
+        float            _pendingFeed  = 0.0f;
+        bool             _reseedOnRun  = false;   // re-project _cmdPos from mpos before resuming
 
         // True while any homing axis is unknown (Alarm:Unhomed jog carve-out active).
         bool anyAxisUnhomed() const;
@@ -57,6 +80,11 @@ namespace Machine {
         float vectorAccel() const;
         // Compute _dirUnit from _vec; returns false if zero vector.
         bool  computeDirection();
+
+        void refillVector(float cruise, float accel, float blockLen, float targetRunway, bool homed);
+        void refillShuttle();
+        // Limiting acceleration over the XY axes (shuttle moves in the XY plane).
+        float shuttleAccel() const;
     };
 
 }

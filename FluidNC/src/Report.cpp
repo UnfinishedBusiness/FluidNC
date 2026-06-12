@@ -603,6 +603,13 @@ void report_realtime_status(Channel& channel) {
         config->_thc->status_report(msg);
     }
 
+#ifdef ENABLE_FW_JOG
+    // Firmware shuttle: |Shu:<vidx>,<s_mm> while a path-window session is open.
+    if (config->_jogging) {
+        config->_jogging->status_report(msg);
+    }
+#endif
+
     if (report_wco_counter > 0) {
         report_wco_counter--;
     } else {

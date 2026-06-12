@@ -10,6 +10,7 @@
 #include "../GCode.h"          // gc_state
 #include "../System.h"         // get_mpos, state_is
 #include "../Channel.h"
+#include "../Logging.h"  // LogStream, log_*, setprecision
 #include "JogMath.h"
 #include "Homing.h"
 
@@ -137,6 +138,10 @@ namespace Machine {
     void Jogging::reset() {
         _phase        = Phase::Idle;
         _entryUnhomed = false;
+        _shuttleOpen  = false;
+        _shuttleDir   = 0;
+        _pendingDir   = 0;
+        _path.clear();
     }
 
     void Jogging::refill() {
@@ -150,19 +155,34 @@ namespace Machine {
                     _entryUnhomed = false;
                     send_alarm(ExecAlarm::Unhomed);
                 }
+                // Shuttle reversal/release has settled to rest on the path. Re-seed the commanded
+                // position to where we actually stopped, then resume if a direction is still held.
+                if (_kind == Kind::Shuttle && _shuttleOpen) {
+                    _reseedOnRun = true;
+                    if (_pendingDir != 0) {
+                        _shuttleDir    = _pendingDir;
+                        _cruise_mm_min = _pendingFeed;
+                        _pendingDir    = 0;
+                        _phase         = Phase::Jogging;
+                    }
+                }
             }
             return;
         }
 
-        float cruise = effectiveCruise();
-        if (cruise <= 0.0f) {
-            return;
+        if (_kind == Kind::Shuttle) {
+            refillShuttle();
+        } else {
+            float cruise = effectiveCruise();
+            if (cruise <= 0.0f) {
+                return;
+            }
+            refillVector(cruise, vectorAccel(), JogMath::block_len_mm(cruise),
+                         JogMath::target_runway_mm(cruise, vectorAccel()), !anyAxisUnhomed());
         }
-        float accel        = vectorAccel();
-        float blockLen     = JogMath::block_len_mm(cruise);
-        float targetRunway = JogMath::target_runway_mm(cruise, accel);
-        bool  homed        = !anyAxisUnhomed();
+    }
 
+    void Jogging::refillVector(float cruise, float accel, float blockLen, float targetRunway, bool homed) {
         int queued = 0;
         while (_phase == Phase::Jogging && plan_get_block_buffer_available() > 1) {
             // Runway = projection of (commanded - machine) onto the jog direction.
@@ -214,6 +234,184 @@ namespace Machine {
         if (queued) {
             protocol_auto_cycle_start();  // wake the stepper into the Jog state
         }
+    }
+
+    float Jogging::shuttleAccel() const {
+        // Limiting acceleration over the XY axes (the shuttle plane), mm/s^2.
+        float accel = 0.0f;
+        auto  axes  = config->_axes;
+        for (int a = 0; a < 2 && a < Axes::_numberAxis; ++a) {
+            if (axes->_axis[a]) {
+                float ax = axes->_axis[a]->_acceleration;
+                accel    = (accel == 0.0f) ? ax : std::min(accel, ax);
+            }
+        }
+        return accel > 0.0f ? accel : 100.0f;
+    }
+
+    void Jogging::refillShuttle() {
+        if (_shuttleDir == 0) {
+            return;  // released: let the planner tail-to-zero coast to a stop on the path
+        }
+
+        // Re-seed the commanded path position to where the machine actually is, after a stop.
+        if (_reseedOnRun) {
+            float* mpos = get_mpos();
+            _cmdPos     = _path.project(mpos[0], mpos[1]);
+            copyAxes(gc_state.position, mpos);  // resync commanded to actual
+            _reseedOnRun = false;
+        }
+
+        float cruise = _cruise_mm_min;
+        if (anyAxisUnhomed() && _unhomed_feed_cap_mm_min > 0) {
+            cruise = std::min(cruise, float(_unhomed_feed_cap_mm_min));
+        }
+        if (cruise <= 0.0f) {
+            return;
+        }
+        float accel        = shuttleAccel();
+        float blockLen     = JogMath::block_len_mm(cruise);
+        float targetRunway = JogMath::target_runway_mm(cruise, accel);
+
+        int queued = 0;
+        while (_phase == Phase::Jogging && plan_get_block_buffer_available() > 1) {
+            // Runway = straight-line distance from machine to the commanded path point. Over the
+            // few queued mm the path is nearly straight, so this tracks queued arc length.
+            float* mpos = get_mpos();
+            float  cx, cy;
+            _path.xy(_cmdPos, cx, cy);
+            float dx     = cx - mpos[0];
+            float dy     = cy - mpos[1];
+            float runway = std::sqrt(dx * dx + dy * dy);
+            if (runway >= targetRunway) {
+                break;
+            }
+
+            bool             atEdge;
+            ShuttlePath::Pos next = _path.advance(_cmdPos, blockLen, _shuttleDir, atEdge);
+            if (next.seg == _cmdPos.seg && next.frac == _cmdPos.frac) {
+                break;  // window edge / path end: no progress, planner tail-to-zero parks us here
+            }
+
+            float target[MAX_N_AXIS];
+            copyAxes(target, gc_state.position);
+            _path.xy(next, target[0], target[1]);  // shuttle moves in XY; Z held
+
+            plan_line_data_t pl;
+            memset(&pl, 0, sizeof(pl));
+            pl.feed_rate             = cruise;
+            pl.motion.noFeedOverride = 1;
+            pl.is_jog                = true;
+            pl.line_number           = JOG_LINE;
+            pl.limits_checked        = true;  // path vertices are inside the program envelope
+
+            if (!mc_linear(target, &pl, gc_state.position)) {
+                break;  // cancelled in-flight
+            }
+            copyAxes(gc_state.position, target);
+            _cmdPos = next;
+            ++queued;
+        }
+
+        if (queued) {
+            protocol_auto_cycle_start();
+        }
+    }
+
+    Error Jogging::shuttleBegin(int total, Channel& out) {
+        if (!(state_is(State::Idle) || (_shuttleOpen && state_is(State::Jog)))) {
+            return Error::SystemGcLock;  // error:9
+        }
+        if (total < 2 || total > 1000000) {
+            return Error::InvalidStatement;  // error:3
+        }
+        _path.begin(total);
+        _cmdPos      = ShuttlePath::Pos {};
+        _shuttleOpen = true;
+        _shuttleDir  = 0;
+        _pendingDir  = 0;
+        _reseedOnRun = true;  // seed from the machine position on the first jog
+        _kind        = Kind::Shuttle;
+        return Error::Ok;
+    }
+
+    Error Jogging::shuttleData(const char* body, Channel& out) {
+        if (!_shuttleOpen) {
+            return Error::SystemGcLock;  // error:9, no session
+        }
+        JogCommand::ShuttleVertex verts[64];
+        int                       first = 0;
+        int                       n     = JogCommand::parse_shuttle_data(body, first, verts, 64);
+        if (n < 0) {
+            return Error::InvalidStatement;  // error:3
+        }
+        if (!_path.put(first, verts, n)) {
+            return Error::InvalidStatement;  // out-of-window / gap
+        }
+        return Error::Ok;
+    }
+
+    Error Jogging::shuttleJog(int8_t dir, float feed_mm_min, Channel& out) {
+        if (!_shuttleOpen) {
+            return Error::SystemGcLock;  // error:9
+        }
+        if (!(state_is(State::Idle) || state_is(State::Jog))) {
+            return Error::SystemGcLock;
+        }
+
+        // Entry validation: the machine must be ON the loaded path (host pre-positions it).
+        if (dir != 0 && _shuttleDir == 0 && !_path.empty()) {
+            float* mpos = get_mpos();
+            float  d2   = 0.0f;
+            _path.project(mpos[0], mpos[1], &d2);
+            if (d2 > 1.0f) {  // > 1 mm off the path
+                return Error::SystemGcLock;  // error:9, not on path
+            }
+        }
+
+        if (dir == 0) {
+            // Release: decel to rest on the path (no reversal pending).
+            _shuttleDir  = 0;
+            _pendingDir  = 0;
+            return stop(out);
+        }
+
+        if (_shuttleDir != 0 && dir != _shuttleDir) {
+            // Reversal: stop first, then resume the other way once at rest (handled in refill()).
+            _pendingDir  = dir;
+            _pendingFeed = feed_mm_min;
+            _shuttleDir  = 0;
+            return stop(out);
+        }
+
+        // Same direction (or starting from rest): hold and refill.
+        _shuttleDir    = dir;
+        _cruise_mm_min = feed_mm_min;
+        _kind          = Kind::Shuttle;
+        _phase         = Phase::Jogging;
+        refill();
+        return Error::Ok;
+    }
+
+    Error Jogging::shuttleEnd(Channel& out) {
+        if (_phase == Phase::Jogging && state_is(State::Jog)) {
+            protocol_do_motion_cancel();
+        }
+        _shuttleOpen = false;
+        _shuttleDir  = 0;
+        _pendingDir  = 0;
+        _phase       = (_phase == Phase::Jogging) ? Phase::Stopping : _phase;
+        _path.clear();
+        return Error::Ok;
+    }
+
+    void Jogging::status_report(LogStream& msg) {
+        if (!_shuttleOpen || _path.empty()) {
+            return;
+        }
+        float*           mpos = get_mpos();
+        ShuttlePath::Pos here = _path.project(mpos[0], mpos[1]);
+        msg << "|Shu:" << here.seg << "," << setprecision(3) << _path.arcFromVertex(here);
     }
 
 }
