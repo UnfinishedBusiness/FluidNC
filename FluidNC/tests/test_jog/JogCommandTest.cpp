@@ -1,9 +1,29 @@
 // Command-parser tests (plan test category 7: parsing fuzz -> reject, never crash).
 
 #include "gtest/gtest.h"
+#include "Machine/JogCapabilities.h"
 #include "Machine/JogCommand.h"
 
+#include <string>
+
 using namespace Machine::JogCommand;
+
+TEST(JogCapabilities, ReportsExactContractLine) {
+    struct CapturingChannel {
+        MsgLevel    level = MsgLevelVerbose;
+        std::string line;
+
+        void sendLine(MsgLevel l, const char* s) {
+            level = l;
+            line  = s;
+        }
+    };
+
+    CapturingChannel out;
+    Machine::reportFwJogCapabilities(out);
+    EXPECT_EQ(out.level, MsgLevelNone);
+    EXPECT_EQ(out.line, "[CAP:FWJOG=1,FWSHU=1]");
+}
 
 TEST(JogVector, ParsesFullVector) {
     Vector v;

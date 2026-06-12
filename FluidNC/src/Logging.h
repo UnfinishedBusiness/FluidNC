@@ -92,6 +92,9 @@ extern bool atMsgLevel(MsgLevel level);
 #define log_fatal_to(out, x) { LogStream ss(out, MsgLevelNone, "[MSG:FATAL: "); ss << x;  Assert(false, "A fatal error occurred"); }
 
 // #define log_to(out, prefix, x) { LogStream ss(out, MsgLevelNone, prefix); ss << x; }
+// NOTE: if x starts with '[', the LogStream destructor appends the closing ']' for you — pass
+// "[TAG:contents" with NO trailing ']' (a literal "[TAG:..]" comes out doubled "[TAG:..]]").
+// For a verbatim fully-bracketed literal, use log_string / out.sendLine(MsgLevelNone, "[..]").
 #define log_stream(out, x) { LogStream ss(out, MsgLevelNone); ss << x; }
 #define log_string(out, x) out.sendLine(MsgLevelNone, x)
 

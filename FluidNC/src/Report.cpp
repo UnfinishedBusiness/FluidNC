@@ -16,6 +16,7 @@
 
 #include "Report.h"
 
+#include "Machine/JogCapabilities.h"
 #include "Machine/MachineConfig.h"
 #include "SettingsDefinitions.h"
 #include "MotionControl.h"               // probe_succeeded
@@ -189,7 +190,7 @@ void report_init_message(Channel& channel) {
 #ifdef ENABLE_FW_JOG
     // Advertise the firmware-native jog/shuttle engines on the boot banner too, so a sender can
     // feature-detect without issuing $I.
-    log_stream(channel, "[CAP:FWJOG=1,FWSHU=1]");
+    Machine::reportFwJogCapabilities(channel);
 #endif
 }
 
@@ -413,7 +414,7 @@ void report_build_info(const char* line, Channel& channel) {
 #ifdef ENABLE_FW_JOG
     // Firmware-native jogging/shuttle capability advertisement (see plans/firmware-jogging).
     // Lets a sender feature-detect the $Jog/* and $Shu/* engines instead of probing.
-    log_stream(channel, "[CAP:FWJOG=1,FWSHU=1]");
+    Machine::reportFwJogCapabilities(channel);
 #endif
 }
 

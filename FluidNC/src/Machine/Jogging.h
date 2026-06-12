@@ -72,9 +72,17 @@ namespace Machine {
         float            _pendingFeed  = 0.0f;
         bool             _reseedOnRun  = false;   // re-project _cmdPos from mpos before resuming
 
-        // True while any homing axis is unknown (Alarm:Unhomed jog carve-out active).
+        // True while any homing axis is unknown.
         bool anyAxisUnhomed() const;
-        // Per-axis-clamped cruise (mm/min) for the current vector, incl. the unhomed cap.
+        // True when this machine has homing enabled and startup homing is required.
+        bool homingRequired() const;
+        // True before dropping from Alarm:Unhomed into Idle for an allowed unhomed jog.
+        bool canStartUnhomedJog() const;
+        // True while the active vector jog is the Alarm:Unhomed carve-out.
+        bool unhomedJogExceptionActive() const;
+        // True when the unhomed jog feed cap must be applied.
+        bool unhomedFeedCapActive() const;
+        // Per-axis-clamped cruise (mm/min) for the current vector, incl. the unhomed cap when active.
         float effectiveCruise() const;
         // Limiting acceleration (mm/s^2) across the active axes of the current vector.
         float vectorAccel() const;

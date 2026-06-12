@@ -42,7 +42,7 @@ A `jogging:` section is optional; defaults are safe.
 ```yaml
 jogging:
   allow_unhomed: false           # permit jogging from Alarm:Unhomed (default false)
-  unhomed_feed_cap_mm_min: 1000  # feed ceiling while any axis is unhomed
+  unhomed_feed_cap_mm_min: 1000  # feed ceiling for the allowed Alarm:Unhomed jog exception
 ```
 
 - **`allow_unhomed`** — when true, a vector jog may start from `Alarm:Unhomed`. The machine
@@ -50,7 +50,8 @@ jogging:
   re-asserts `Alarm:Unhomed` when the jog ends, so program-start homing enforcement and the
   sender's homing badge stay truthful. No soft-limit envelope is applied while unhomed, so
   the feed cap is the only protection — keep it conservative.
-- **`unhomed_feed_cap_mm_min`** — the feed ceiling applied while any axis is unhomed.
+- **`unhomed_feed_cap_mm_min`** — the feed ceiling applied only to the allowed
+  `Alarm:Unhomed` jog exception on machines with required homing enabled.
 
 ## Vector jog (`$Jog/*`)
 

@@ -32,6 +32,10 @@ size_t LogStream::write(uint8_t c) {
 }
 
 LogStream::~LogStream() {
+    // GOTCHA: any line that starts with '[' gets its closing ']' appended HERE, automatically.
+    // So log_stream()/log_info()/log_*() callers must pass only the opening "[TAG:" and the
+    // contents, NEVER a trailing ']' — doing so yields a doubled "]]" (e.g. "[CAP:..]" -> "[CAP:..]]").
+    // To emit a fully-bracketed literal verbatim, bypass LogStream: channel.sendLine(MsgLevelNone, "[..]").
     if ((*_line).length() && (*_line)[0] == '[') {
         *_line += ']';
     }

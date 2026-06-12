@@ -36,6 +36,23 @@ namespace Machine {
         return Homing::unhomed_axes() != 0;
     }
 
+    bool Jogging::homingRequired() const {
+        return config && config->_start && config->_start->_mustHome && Axes::homingMask != 0;
+    }
+
+    bool Jogging::canStartUnhomedJog() const {
+        return _allow_unhomed && homingRequired() && anyAxisUnhomed() && state_is(State::Alarm) &&
+               (lastAlarm == ExecAlarm::Unhomed);
+    }
+
+    bool Jogging::unhomedJogExceptionActive() const {
+        return _entryUnhomed && _allow_unhomed && homingRequired() && anyAxisUnhomed();
+    }
+
+    bool Jogging::unhomedFeedCapActive() const {
+        return unhomedJogExceptionActive() && _unhomed_feed_cap_mm_min > 0;
+    }
+
     bool Jogging::computeDirection() {
         float len2 = 0.0f;
         for (int a = 0; a < 3; ++a) {
@@ -66,7 +83,7 @@ namespace Machine {
 
     float Jogging::effectiveCruise() const {
         // Clamp the requested cruise so no active axis exceeds its max_rate along the vector,
-        // then apply the unhomed feed cap when any axis is unhomed.
+        // then apply the unhomed feed cap only for the Alarm:Unhomed jog carve-out.
         float maxRate[3] = { 0, 0, 0 };
         auto  axes       = config->_axes;
         for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
@@ -75,7 +92,7 @@ namespace Machine {
             }
         }
         float cruise = JogMath::clamp_feed_to_axis_rates(_cruise_mm_min, _dirUnit, maxRate);
-        if (anyAxisUnhomed() && _unhomed_feed_cap_mm_min > 0) {
+        if (unhomedFeedCapActive()) {
             cruise = std::min(cruise, float(_unhomed_feed_cap_mm_min));
         }
         return cruise;
@@ -83,7 +100,7 @@ namespace Machine {
 
     Error Jogging::startVector(const JogCommand::Vector& v, Channel& out) {
         // Allowed states: Idle, Jog, or the Alarm:Unhomed carve-out.
-        bool unhomedCarveout = _allow_unhomed && state_is(State::Alarm) && (lastAlarm == ExecAlarm::Unhomed);
+        bool unhomedCarveout = canStartUnhomedJog();
         if (!(state_is(State::Idle) || state_is(State::Jog) || unhomedCarveout)) {
             return Error::SystemGcLock;  // error:9, disallowed state
         }
@@ -116,6 +133,7 @@ namespace Machine {
             return Error::Ok;  // no-op when not jogging (per protocol)
         }
         _cruise_mm_min = feed_mm_min;
+        refill();
         return Error::Ok;
     }
 
@@ -178,7 +196,7 @@ namespace Machine {
                 return;
             }
             refillVector(cruise, vectorAccel(), JogMath::block_len_mm(cruise),
-                         JogMath::target_runway_mm(cruise, vectorAccel()), !anyAxisUnhomed());
+                         JogMath::target_runway_mm(cruise, vectorAccel()), !unhomedJogExceptionActive());
         }
     }
 
@@ -263,7 +281,7 @@ namespace Machine {
         }
 
         float cruise = _cruise_mm_min;
-        if (anyAxisUnhomed() && _unhomed_feed_cap_mm_min > 0) {
+        if (unhomedFeedCapActive()) {
             cruise = std::min(cruise, float(_unhomed_feed_cap_mm_min));
         }
         if (cruise <= 0.0f) {
