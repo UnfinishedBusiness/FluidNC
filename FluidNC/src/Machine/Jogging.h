@@ -47,7 +47,12 @@ namespace Machine {
         // Called from protocol_exec_rt_system (main loop, NOT an ISR) to top up the queue.
         void refill();
 
-        // Dropped to idle on alarm/reset/disconnect (same as a JogCancel).
+        // Belt-and-suspenders teardown: called from every external motion-termination site
+        // (jog-cancel flush, soft reset, alarm) so the module exits Phase::Jogging immediately
+        // instead of waiting for refill() to notice. Idempotent; queues nothing.
+        void onMotionTerminated();
+
+        // Full teardown incl. shuttle session (alarm/reset/disconnect).
         void reset();
 
         bool active() const { return _phase != Phase::Idle; }
@@ -62,6 +67,11 @@ namespace Machine {
         float  _dirUnit[3]       = { 0, 0, 0 };  // normalized jog vector (XYZ)
         float  _cruise_mm_min    = 0.0f;         // requested cruise (pre per-axis clamp)
         bool   _entryUnhomed     = false;        // started from Alarm:Unhomed -> return there on stop
+
+        // Lifecycle guard state (see JogLifecycle.h). Validated every refill tick so motion never
+        // resurrects after an external termination (0x85, hold, reset, alarm, completion).
+        bool _sawJog            = false;  // have observed State::Jog since this jog started
+        int  _pendingStartTicks = 0;      // remaining ticks of the Idle->Jog start handoff window
 
         // Shuttle (path-window) state.
         ShuttlePath      _path;
@@ -93,6 +103,11 @@ namespace Machine {
         void refillShuttle();
         // Limiting acceleration over the XY axes (shuttle moves in the XY plane).
         float shuttleAccel() const;
+
+        // Arm the Idle->Jog start-handoff window before issuing a cycle start.
+        void beginPendingStart();
+        // Flush queued-but-unstarted jog blocks so nothing executes (the quick-tap race).
+        void flushQueuedJog();
     };
 
 }

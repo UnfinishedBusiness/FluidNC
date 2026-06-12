@@ -114,6 +114,51 @@ auto-report) carries:
 
 The sender uses this to highlight the live position along the toolpath.
 
+## Lifecycle & termination (safety)
+
+The engine keeps blocks queued while it believes it is jogging, and tops the queue up from the
+realtime loop. That self-refill is what makes held velocity flat — but it also means the engine
+**must stop refilling the instant the motion is no longer genuinely its own**, or it would
+re-queue blocks (and re-fire cycle start) right after a panic action and resurrect motion. Two
+layers guarantee that:
+
+**1. Self-validating refill (primary).** Every refill tick the engine validates the live machine
+state and stops — queueing nothing and dropping to idle — unless one of these holds:
+
+- the machine is in `Jog` **and** no cancel/hold/door (suspend) condition is active; or
+- the machine is in `Idle` during the brief, self-initiated `Idle→Jog` start handoff (bounded by
+  a few ticks so a start that never takes — e.g. a jog that immediately parks on a soft limit —
+  expires instead of spinning).
+
+Any other observation — `Idle` after the jog ran, `Alarm`, `Hold`, `Sleep`, `Homing`, a program
+`Cycle`, `SafetyDoor`, or a jog-cancel/feed-hold in progress (a suspend bit set while still
+`Jog`) — terminates the engine. This guard alone defeats the runaway even with no other wiring.
+
+**2. Belt-and-suspenders teardown (immediate).** The engine is also told the moment the system
+terminates motion, so it exits on the same tick rather than at the next refill. `onMotionTerminated()`
+is called from three sites (all gated to FWJOG builds): the jog-cancel buffer flush, the soft-reset
+handler, and the alarm handler.
+
+Termination matrix (each verified by a test that asserts **no blocks are queued or executed**
+after the action):
+
+| Action while jogging | Result |
+|----------------------|--------|
+| Realtime jog-cancel `0x85` | decelerate, flush, engine terminates — no re-queue |
+| Feed-hold | engine terminates |
+| Soft reset `0x18` | engine terminates |
+| Alarm (limit, etc.) | engine terminates |
+| `$X` unlock *after* an alarmed jog | does **not** resume the old jog |
+| `$Jog/Stop` "quick tap" (before motion starts) | queued runway is flushed — executed distance ≈ 0, not the full `v²`-scaled runway |
+
+**Stop guarantees no leftover motion in every state.** `$Jog/Stop` (and `$Shu/End`) decelerate
+through the normal jog-cancel path when motion is live (`Jog`); when a stop arrives during the
+start handoff (`Idle`, cycle start not yet processed) the queued-but-unstarted blocks are flushed
+directly, so a fast tap can never lurch the whole queued runway.
+
+**Vector and shuttle modes are mutually exclusive and reset on each start**, so a vector jog
+issued after a shuttle session always runs as a vector jog (and vice-versa).
+
 ## Capability advertisement
 
 When the engine is compiled in, the firmware advertises it on the **boot banner** and in

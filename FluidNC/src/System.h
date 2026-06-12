@@ -199,3 +199,8 @@ float* get_mpos();
 float* get_wco();
 
 bool inMotionState();  // True if moving, i.e. the stepping engine is active
+
+// True while a motion-ending suspend condition (jog/motion cancel, feed hold, safety door, sleep)
+// is active. Used by the firmware jog engine to stop refilling the instant a cancel begins, even
+// while sys.state() is still Jog during the deceleration.
+bool sys_motion_ending();

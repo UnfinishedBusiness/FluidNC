@@ -443,6 +443,13 @@ static void protocol_do_start() {
 
 static void protocol_do_alarm(void* alarmVoid) {
     lastAlarm = (ExecAlarm)((int)(intptr_t)alarmVoid);
+#ifdef ENABLE_FW_JOG
+    // Any alarm terminates motion: tear the jog module down so refill() stops re-queueing. (State
+    // is not yet Idle here, so the module will not re-assert its own Unhomed alarm over this one.)
+    if (config && config->_jogging) {
+        config->_jogging->onMotionTerminated();
+    }
+#endif
     if (spindle->_off_on_alarm) {
         spindle->stop();
     }
@@ -798,6 +805,14 @@ void protocol_disable_steppers() {
     }
 }
 
+void protocol_flush_queued_jog() {
+    sys.step_control = {};
+    plan_reset();
+    Stepper::reset();
+    gc_sync_position();
+    plan_sync_position();
+}
+
 void protocol_do_cycle_stop() {
     // log_debug("protocol_do_cycle_stop " << state_name());
     protocol_disable_steppers();
@@ -836,11 +851,13 @@ void protocol_do_cycle_stop() {
             // Motion complete. Includes CYCLE/JOG/HOMING states and jog cancel/motion cancel/soft limit events.
             // NOTE: Motion and jog cancel both immediately return to idle after the hold completes.
             if (sys.suspend().bit.jogCancel) {  // For jog cancel, flush buffers and sync positions.
-                sys.step_control = {};
-                plan_reset();
-                Stepper::reset();
-                gc_sync_position();
-                plan_sync_position();
+                protocol_flush_queued_jog();
+#ifdef ENABLE_FW_JOG
+                // Jog terminated by cancel: tear the jog module down so refill() stops re-queueing.
+                if (config && config->_jogging) {
+                    config->_jogging->onMotionTerminated();
+                }
+#endif
             }
             if (sys.suspend().bit.safetyDoorAjar) {  // Only occurs when safety door opens during jog.
                 auto suspend             = sys.suspend();
@@ -1153,6 +1170,12 @@ static void protocol_do_fault_pin(void* arg) {
     log_info("Stopped by " << pin->legend());
 }
 void protocol_do_rt_reset() {
+#ifdef ENABLE_FW_JOG
+    // Soft reset (0x18): tear the jog module down so it cannot resurrect motion after the abort.
+    if (config && config->_jogging) {
+        config->_jogging->onMotionTerminated();
+    }
+#endif
     if (state_is(State::Homing)) {
         Machine::Homing::fail(ExecAlarm::HomingFailReset);
     } else if (state_is(State::Cycle) || state_is(State::Jog) || sys.step_control.executeHold || sys.step_control.executeSysMotion) {

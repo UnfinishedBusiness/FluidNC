@@ -32,6 +32,8 @@ namespace {
     float                    testMpos[MAX_N_AXIS] = {};
     uint8_t                  plannerAvailable     = 8;
     bool                     constrainJogCalled   = false;
+    bool                     testMotionEnding     = false;  // sys_motion_ending() (suspend bits)
+    int                      flushCount           = 0;      // protocol_flush_queued_jog() calls
     std::vector<PlannedLine> plannedLines;
 
     Channel& fakeChannel() {
@@ -125,6 +127,15 @@ bool mc_linear(float* target, plan_line_data_t* pl_data, float*) {
 void protocol_auto_cycle_start() {}
 void protocol_do_motion_cancel() {}
 
+bool sys_motion_ending() {
+    return testMotionEnding;
+}
+
+void protocol_flush_queued_jog() {
+    ++flushCount;
+    plannedLines.clear();  // model the planner buffer being emptied
+}
+
 void send_alarm(ExecAlarm alarm) {
     lastAlarm = alarm;
     set_state(State::Alarm);
@@ -148,6 +159,8 @@ namespace {
             plannedLines.clear();
             plannerAvailable   = 8;
             constrainJogCalled = false;
+            testMotionEnding   = false;
+            flushCount         = 0;
             lastAlarm          = ExecAlarm::None;
             testState          = State::Idle;
 
@@ -189,7 +202,105 @@ namespace {
             v.feed_mm_min = feed;
             return jogging.startVector(v, fakeChannel());
         }
+
+        // Start a vector jog and advance it to a genuinely-running state (cycle start processed).
+        void establishJog(float feed) {
+            setHomingEnabled(true);
+            ASSERT_EQ(startX(feed), Error::Ok);  // queues blocks; state still Idle (start handoff)
+            testState = State::Jog;              // cycle start processed -> Jog
+            jogging.refill();                    // observes Jog: keeps the runway topped up
+            ASSERT_TRUE(jogging.active());
+        }
     };
+
+    // ---- Runaway acceptance matrix: every termination path must queue NOTHING more ----
+
+    TEST_F(JoggingPlannerTest, Cancel0x85MidJogDoesNotResurrect) {
+        establishJog(6000.0f);
+        size_t before    = plannedLines.size();
+        testMotionEnding = true;  // 0x85 sets jogCancel while state is still Jog during decel
+        jogging.refill();
+        EXPECT_EQ(plannedLines.size(), before);  // queued nothing more
+        EXPECT_FALSE(jogging.active());          // module terminated
+        // Resurrection check: it stays dead on subsequent ticks.
+        jogging.refill();
+        jogging.refill();
+        EXPECT_EQ(plannedLines.size(), before);
+        EXPECT_FALSE(jogging.active());
+    }
+
+    TEST_F(JoggingPlannerTest, FeedHoldMidJogTerminates) {
+        establishJog(6000.0f);
+        size_t before = plannedLines.size();
+        testState     = State::Hold;
+        jogging.refill();
+        EXPECT_EQ(plannedLines.size(), before);
+        EXPECT_FALSE(jogging.active());
+    }
+
+    TEST_F(JoggingPlannerTest, AlarmMidJogTerminates) {
+        establishJog(6000.0f);
+        size_t before = plannedLines.size();
+        testState     = State::Alarm;
+        jogging.refill();
+        EXPECT_EQ(plannedLines.size(), before);
+        EXPECT_FALSE(jogging.active());
+    }
+
+    TEST_F(JoggingPlannerTest, SoftResetMidJogTerminatesAndStaysDead) {
+        establishJog(6000.0f);
+        jogging.onMotionTerminated();  // what protocol_do_rt_reset()'s hook calls
+        EXPECT_FALSE(jogging.active());
+        size_t before = plannedLines.size();
+        testState     = State::Idle;  // reset returns to Idle
+        jogging.refill();
+        jogging.refill();
+        EXPECT_EQ(plannedLines.size(), before);  // no resurrection
+        EXPECT_FALSE(jogging.active());
+    }
+
+    TEST_F(JoggingPlannerTest, UnlockAfterAlarmedJogDoesNotResume) {
+        establishJog(6000.0f);
+        testState = State::Alarm;
+        jogging.refill();  // alarm terminates the jog
+        ASSERT_FALSE(jogging.active());
+        size_t before = plannedLines.size();
+        testState     = State::Idle;  // $X unlock
+        for (int i = 0; i < 5; ++i) {
+            jogging.refill();
+        }
+        EXPECT_EQ(plannedLines.size(), before);  // the old jog must NOT resume
+        EXPECT_FALSE(jogging.active());
+    }
+
+    TEST_F(JoggingPlannerTest, QuickTapStopFlushesQueuedRunway) {
+        setHomingEnabled(true);
+        // Tap race: start queues the runway, but the cycle start has NOT been processed (Idle).
+        ASSERT_EQ(startX(12000.0f), Error::Ok);
+        ASSERT_FALSE(plannedLines.empty());  // a runway was queued
+        ASSERT_TRUE(jogging.active());
+        // Stop arrives before the state flips to Jog.
+        ASSERT_EQ(jogging.stop(fakeChannel()), Error::Ok);
+        EXPECT_GE(flushCount, 1);            // queued-but-unstarted blocks were flushed
+        EXPECT_TRUE(plannedLines.empty());   // nothing left to execute (~0 distance, not the runway)
+        EXPECT_FALSE(jogging.active());
+    }
+
+    TEST_F(JoggingPlannerTest, ShuttleSessionThenVectorJogRestoresKind) {
+        setHomingEnabled(true);
+        // Shuttle a tiny path, which sets _kind = Shuttle.
+        ASSERT_EQ(jogging.shuttleBegin(2, fakeChannel()), Error::Ok);
+        ASSERT_EQ(jogging.shuttleData("0:0,0;100,0", fakeChannel()), Error::Ok);
+        ASSERT_EQ(jogging.shuttleJog(1, 3000.0f, fakeChannel()), Error::Ok);
+        ASSERT_EQ(jogging.shuttleEnd(fakeChannel()), Error::Ok);
+        testState = State::Idle;
+        jogging.refill();
+        plannedLines.clear();
+        // A vector jog must now dispatch to the VECTOR refill (sticky-kind bug would leave it dead).
+        ASSERT_EQ(startX(6000.0f), Error::Ok);
+        EXPECT_FALSE(plannedLines.empty());
+        EXPECT_FLOAT_EQ(plannedLines.front().feed, 6000.0f);
+    }
 
     TEST_F(JoggingPlannerTest, HomingDisabledDoesNotApplyUnhomedFeedCap) {
         setHomingEnabled(false);

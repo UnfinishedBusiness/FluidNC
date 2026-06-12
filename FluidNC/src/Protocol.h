@@ -47,6 +47,11 @@ void protocol_cancel_disable_steppers();
 
 void protocol_do_motion_cancel();
 
+// Flush jog blocks that are queued but not yet executing, syncing planner/gcode position to the
+// (unmoved) machine position. Used by the jog-cancel completion and by the jog engine's stop()
+// to guarantee no queued jog motion runs after a stop issued during the Idle->Jog start handoff.
+void protocol_flush_queued_jog();
+
 extern volatile bool rtCycleStop;
 
 extern volatile bool runLimitLoop;

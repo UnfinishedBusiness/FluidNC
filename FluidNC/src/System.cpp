@@ -151,3 +151,9 @@ bool inMotionState() {
     return state_is(State::Cycle) || state_is(State::Homing) || state_is(State::Jog) ||
            (state_is(State::Hold) && !sys.suspend().bit.holdComplete);
 }
+
+bool sys_motion_ending() {
+    // Any suspend bit (jogCancel / motionCancel / holdComplete / safetyDoorAjar / ...) means a
+    // termination is in progress; the jog engine must stop queueing immediately.
+    return sys.suspend().value != 0;
+}
