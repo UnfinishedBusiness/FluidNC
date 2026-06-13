@@ -171,6 +171,24 @@ the `$I` build-info response:
 `FWJOG` = the `$Jog/*` vector engine; `FWSHU` = the `$Shu/*` shuttle engine. A sender should
 feature-detect from this line and fall back to streamed `$J=` jogs when it is absent.
 
+**`$Cap` (anyState)** emits the same line on demand. Use it: the boot banner is missed whenever
+the sender opens the port after boot, and `$I` is unusable on a `must_home` board parked in
+Alarm:Unhomed — passive detection alone made the jog source nondeterministic across reboots.
+
+## Velocity hold & queue capacity
+
+The planner ring holds `planner_blocks` (~16) entries; only `(planner_blocks − 2)` of runway can
+ever be queued. Jog blocks are therefore sized by `JogMath::block_len_for_hold_mm` so capacity
+covers **1.5 × braking distance** at the cruise, and `max_holdable_feed_mm_min` clamps the cruise
+when even 50 mm blocks can't cover it (extreme feed²/accel) — otherwise the queue saturates below
+the velocity-hold threshold and the feed sags/oscillates exactly like host-streamed `$J=`
+(the original F15240 bench defect). Live queue health is reported as `|JogQ:<runway>,<target>`
+in the `?` status while a vector jog runs: runway pinned at/above target = flat velocity.
+
+A `$Jog/Start` arriving during a cancel decel (rapid tap, quick reversal) is queued as a pending
+restart and re-armed from the Stopping finalizer at clean Idle — never dropped, never fighting
+the flush.
+
 ## Build
 
 The engine is on for the radio-less targets. To produce the full tester bundle (all five

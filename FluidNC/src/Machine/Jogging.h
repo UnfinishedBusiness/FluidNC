@@ -73,6 +73,16 @@ namespace Machine {
         bool _sawJog            = false;  // have observed State::Jog since this jog started
         int  _pendingStartTicks = 0;      // remaining ticks of the Idle->Jog start handoff window
 
+        // Vector restart queued by a $Jog/Start that arrived during a cancel decel (Phase::Stopping).
+        // Re-armed by refill()'s Stopping finalizer from a clean Idle; cancelled on hard termination.
+        bool   _pendingVecRestart = false;
+        int8_t _pendingVec[3]     = { 0, 0, 0 };
+        float  _pendingVecFeed    = 0.0f;
+
+        // Live queue health for the |JogQ status field (set by refillVector each pass).
+        float _lastRunwayMm = 0.0f;
+        float _lastTargetMm = 0.0f;
+
         // Shuttle (path-window) state.
         ShuttlePath      _path;
         ShuttlePath::Pos _cmdPos;                 // commanded position along the path

@@ -107,6 +107,84 @@ TEST(JogMath, TargetRunwayIsMaxOfBrakingAndBlocks) {
     EXPECT_NEAR(target_runway_mm(3000.0f, 100.0f), 18.75f, 1e-3f);
 }
 
+// ── Queue-capacity sizing (the bench "jitters like $J=" defect at F15240) ────────────────────
+//
+// The FlatVelocityInvariant simulation above queues UNBOUNDED blocks — which is exactly why the
+// capacity defect passed it. The real planner ring holds (planner_blocks - 2) usable entries; at
+// high feed the plain v*0.04s block length saturates the ring BELOW the velocity-hold threshold
+// (F15240 @ 250 mm/s^2, 16 blocks: capacity 14 x 10.16 = 142mm < 1.5 x braking 194mm) and the
+// executing feed sags and oscillates. These tests model the cap and pin the sizing that closes it.
+
+namespace {
+    // Same tail-to-zero model as simulate_hold, but the queue holds at most `max_blocks` blocks.
+    SimResult simulate_hold_capped(float cruise, float accel, float block, float target, int max_blocks, float sim_s) {
+        const float dt       = 0.001f;
+        float       R        = 0.0f;
+        int         queued   = 0;
+        float       min_feed = cruise * 10.0f;
+        bool        dipped   = false;
+        int         ticks    = static_cast<int>(sim_s / dt);
+
+        for (int i = 0; i < ticks; i++) {
+            // In-process refill every tick, but bounded by the planner ring.
+            while (R < target && queued < max_blocks) {
+                R += block;
+                ++queued;
+            }
+            float feed     = executing_feed_mm_min(R, cruise, accel);
+            float consumed = feed * MM_MIN_TO_MM_S * dt;
+            if (R > 0.0f && consumed >= 0.0f) {
+                float before = R;
+                R            = std::max(0.0f, R - consumed);
+                // Retire whole blocks as the executing point crosses them.
+                while (queued > 0 && before - R >= 0.0f && R < float(queued - 1) * block) {
+                    --queued;
+                }
+            }
+            if (i > 50) {  // allow the (capped) accel ramp to finish
+                min_feed = std::min(min_feed, feed);
+                if (feed < cruise - 1.0f) {
+                    dipped = true;
+                }
+            }
+        }
+        return { min_feed, dipped };
+    }
+}
+
+TEST(JogMathCapacity, PlainSizingSagsAtBenchFeed) {
+    // Documents the defect the hold-sizing closes: bench parameters, plain v*0.04s blocks.
+    const float cruise = 15240.0f, accel = 250.0f;
+    SimResult   r = simulate_hold_capped(cruise, accel, block_len_mm(cruise), target_runway_mm(cruise, accel),
+                                         /*max_blocks=*/16 - 2, /*sim_s=*/3.0f);
+    EXPECT_TRUE(r.ever_dipped) << "expected the capacity-saturated sag (else this guard is vacuous)";
+}
+
+TEST(JogMathCapacity, HoldSizedBlocksHoldBenchFeed) {
+    const float cruise = 15240.0f, accel = 250.0f;
+    const int   blocks = 16;
+    const float len    = block_len_for_hold_mm(cruise, accel, blocks);
+    EXPECT_GE(queue_capacity_mm(len, blocks), 1.5f * braking_distance_mm(cruise, accel) - 1e-3f);
+    SimResult r = simulate_hold_capped(cruise, accel, len, target_runway_for_mm(cruise, accel, len),
+                                       blocks - 2, 3.0f);
+    EXPECT_FALSE(r.ever_dipped) << "hold-sized blocks must pin the bench feed flat";
+    EXPECT_NEAR(r.min_feed_after_accel, cruise, 1.0f);
+}
+
+TEST(JogMathCapacity, ExtremeFeedClampsToHoldable) {
+    // F30000 @ 100 mm/s^2: even 50mm blocks can't cover braking — the cruise must clamp to what
+    // the queue CAN hold, and at that clamped cruise the capacity covers 1.5 x braking.
+    const int   blocks   = 16;
+    const float holdable = max_holdable_feed_mm_min(100.0f, blocks);
+    EXPECT_LT(holdable, 30000.0f);
+    EXPECT_GT(holdable, 0.0f);
+    const float len = block_len_for_hold_mm(holdable, 100.0f, blocks);
+    EXPECT_GE(queue_capacity_mm(len, blocks), 1.5f * braking_distance_mm(holdable, 100.0f) - 1e-2f);
+    SimResult r = simulate_hold_capped(holdable, 100.0f, len, target_runway_for_mm(holdable, 100.0f, len),
+                                       blocks - 2, 3.0f);
+    EXPECT_FALSE(r.ever_dipped);
+}
+
 TEST(JogMath, MaxFeedAtBrakingDistanceEqualsCruise) {
     // At runway == braking distance, the fastest holdable feed is exactly cruise.
     float brake = braking_distance_mm(3000.0f, 500.0f);

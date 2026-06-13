@@ -133,6 +133,19 @@ namespace Machine {
         _cruise_mm_min = v.feed_mm_min;
         _kind          = Kind::Vector;  // fix sticky-kind: a vector jog after a shuttle session must dispatch to refillVector
 
+        if (_phase == Phase::Stopping) {
+            // A start during a cancel decel (rapid tap / quick reversal). Don't fight the flush —
+            // queue the restart; refill()'s Stopping finalizer re-arms it once the stop settles.
+            // (Without this the lifecycle guard rightly terminates the premature restart and the
+            // operator's held key is silently dropped.)
+            _pendingVecRestart = true;
+            for (int a = 0; a < 3; ++a) {
+                _pendingVec[a] = _vec[a];
+            }
+            _pendingVecFeed = _cruise_mm_min;
+            return Error::Ok;
+        }
+
         if (_phase == Phase::Idle) {
             _entryUnhomed = unhomedCarveout;
             if (unhomedCarveout) {
@@ -201,7 +214,8 @@ namespace Machine {
         _sawJog            = false;
         _pendingStartTicks = 0;
         _shuttleDir        = 0;
-        _pendingDir        = 0;  // a hard termination cancels any pending shuttle reversal/resume
+        _pendingDir        = 0;      // a hard termination cancels any pending shuttle reversal/resume
+        _pendingVecRestart = false;  // ... and any vector restart queued during a decel
         if (_shuttleOpen) {
             _reseedOnRun = true;  // re-project the commanded position on the next shuttle jog
         }
@@ -238,6 +252,21 @@ namespace Machine {
                         _phase = Phase::Jogging;
                     }
                 }
+                // Vector restart queued during the decel (rapid tap / reversal): re-arm it now,
+                // but only from a clean Idle (an alarm termination must stay terminated).
+                if (_kind == Kind::Vector && _pendingVecRestart) {
+                    _pendingVecRestart = false;
+                    if (state_is(State::Idle)) {
+                        for (int a = 0; a < 3; ++a) {
+                            _vec[a] = _pendingVec[a];
+                        }
+                        if (computeDirection()) {
+                            _cruise_mm_min = _pendingVecFeed;
+                            beginPendingStart();
+                            _phase = Phase::Jogging;
+                        }
+                    }
+                }
             }
             return;
         }
@@ -269,13 +298,22 @@ namespace Machine {
             if (cruise <= 0.0f) {
                 return;
             }
-            refillVector(cruise, vectorAccel(), JogMath::block_len_mm(cruise),
-                         JogMath::target_runway_mm(cruise, vectorAccel()), !unhomedJogExceptionActive());
+            // Queue-capacity closure (see JogMath.h): cap the cruise to what the planner ring can
+            // physically HOLD, and size blocks so capacity covers 1.5x braking — otherwise high
+            // feeds saturate the queue below the velocity-hold threshold and the feed sags and
+            // oscillates (the bench "jitters like $J=" defect at F15240).
+            float accel  = vectorAccel();
+            int   blocks = config->_planner_blocks;
+            cruise       = std::min(cruise, JogMath::max_holdable_feed_mm_min(accel, blocks));
+            float len    = JogMath::block_len_for_hold_mm(cruise, accel, blocks);
+            refillVector(cruise, accel, len, JogMath::target_runway_for_mm(cruise, accel, len), !unhomedJogExceptionActive());
         }
     }
 
     void Jogging::refillVector(float cruise, float accel, float blockLen, float targetRunway, bool homed) {
-        int queued = 0;
+        int queued     = 0;
+        _lastRunwayMm  = 0.0f;
+        _lastTargetMm  = targetRunway;
         while (_phase == Phase::Jogging && plan_get_block_buffer_available() > 1) {
             // Runway = projection of (commanded - machine) onto the jog direction.
             float* mpos   = get_mpos();
@@ -283,6 +321,7 @@ namespace Machine {
             for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
                 runway += (gc_state.position[a] - mpos[a]) * _dirUnit[a];
             }
+            _lastRunwayMm = runway;  // live queue health for the |JogQ status field
             if (runway >= targetRunway) {
                 break;
             }
@@ -500,6 +539,12 @@ namespace Machine {
     }
 
     void Jogging::status_report(LogStream& msg) {
+        // Live queue health while vector-jogging: |JogQ:<runway_mm>,<target_mm>. Bench-diagnosable
+        // velocity hold — runway pinned at/above target == flat feed; runway sagging below braking
+        // distance == the planner is decelerating (capacity/cadence problem to investigate).
+        if (_phase == Phase::Jogging && _kind == Kind::Vector) {
+            msg << "|JogQ:" << setprecision(1) << _lastRunwayMm << "," << _lastTargetMm;
+        }
         if (!_shuttleOpen || _path.empty()) {
             return;
         }

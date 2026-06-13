@@ -1005,6 +1005,7 @@ static Error list_parameters(const char* value, AuthenticationLevel auth_level, 
 
 #ifdef ENABLE_FW_JOG
 #    include "Machine/JogCommand.h"
+#    include "Machine/JogCapabilities.h"
 static Error fwJogStart(const char* value, AuthenticationLevel, Channel& out) {
     if (!config->_jogging) {
         return Error::InvalidStatement;
@@ -1058,6 +1059,13 @@ static Error fwShuEnd(const char* value, AuthenticationLevel, Channel& out) {
         return Error::InvalidStatement;
     }
     return config->_jogging->shuttleEnd(out);
+}
+static Error fwCapReport(const char* value, AuthenticationLevel, Channel& out) {
+    // On-demand capability line. The boot banner is missed when the sender opens the port after
+    // boot, and $I is Idle-gated host-side (a must_home board sits in Alarm:Unhomed) — so a sender
+    // queries $Cap right at connect, in ANY state, and feature-detects deterministically.
+    Machine::reportFwJogCapabilities(out);
+    return Error::Ok;
 }
 #endif
 
@@ -1148,6 +1156,7 @@ void make_user_commands() {
     new UserCommand("SHD", "Shu/Data", fwShuData, anyState);
     new UserCommand("SHJ", "Shu/Jog", fwShuJog, anyState);
     new UserCommand("SHE", "Shu/End", fwShuEnd, anyState);
+    new UserCommand("CAP", "Cap", fwCapReport, anyState);
 #endif
     new AsyncUserCommand("G", "GCode/Modes", report_gcode, anyState);
 };
