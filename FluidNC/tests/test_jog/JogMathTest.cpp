@@ -100,11 +100,25 @@ TEST(JogMath, BlockLenClamped) {
     EXPECT_NEAR(block_len_mm(120000.0f), 50.0f, 1e-4f);// 2000 mm/s * 0.04 = 80 -> cap 50
 }
 
-TEST(JogMath, TargetRunwayIsMaxOfBrakingAndBlocks) {
-    // cruise 3000, accel 500: 1.5*2.5=3.75 vs 3*2.0=6.0 -> 6.0
-    EXPECT_NEAR(target_runway_mm(3000.0f, 500.0f), 6.0f, 1e-4f);
-    // cruise 3000, accel 100: braking 12.5, 1.5*12.5=18.75 vs 6.0 -> 18.75
-    EXPECT_NEAR(target_runway_mm(3000.0f, 100.0f), 18.75f, 1e-3f);
+TEST(JogMath, TargetRunwayIsMaxOfBrakingPlusSlackAndBlocks) {
+    // cruise 3000 (v=50mm/s), accel 500: brake 2.5 + slack 50*0.08=4.0 -> 6.5 vs 3 blocks 6.0 -> 6.5
+    EXPECT_NEAR(target_runway_mm(3000.0f, 500.0f), 6.5f, 1e-3f);
+    // cruise 3000, accel 100: brake 12.5 + 4.0 = 16.5 vs 6.0 -> 16.5
+    EXPECT_NEAR(target_runway_mm(3000.0f, 100.0f), 16.5f, 1e-3f);
+}
+
+// The runway slack must cover the worst protocol-loop stall AT EVERY SPEED: the slack in TIME
+// (slack distance / v) is constant by construction — this pins the 45%-clean/100%-shaky bench
+// gradient closed (constant-distance margins shrink in time as v rises; v x slack does not).
+TEST(JogMath, RunwaySlackIsConstantInTime) {
+    for (float feed : { 3000.0f, 7620.0f, 15240.0f }) {
+        float v     = feed * MM_MIN_TO_MM_S;
+        float brake = braking_distance_mm(feed, 1524.0f);
+        float slack = target_runway_mm(feed, 1524.0f) - brake;
+        if (slack > 0.0f) {  // above the 3-block floor
+            EXPECT_NEAR(slack / v, LOOP_SLACK_S, 0.02f) << "feed=" << feed;
+        }
+    }
 }
 
 // ── Queue-capacity sizing (the bench "jitters like $J=" defect at F15240) ────────────────────
@@ -163,8 +177,9 @@ TEST(JogMathCapacity, PlainSizingSagsAtBenchFeed) {
 TEST(JogMathCapacity, HoldSizedBlocksHoldBenchFeed) {
     const float cruise = 15240.0f, accel = 250.0f;
     const int   blocks = 16;
+    const float vmm_s  = cruise * MM_MIN_TO_MM_S;
     const float len    = block_len_for_hold_mm(cruise, accel, blocks);
-    EXPECT_GE(queue_capacity_mm(len, blocks), 1.5f * braking_distance_mm(cruise, accel) - 1e-3f);
+    EXPECT_GE(queue_capacity_mm(len, blocks), braking_distance_mm(cruise, accel) + vmm_s * LOOP_SLACK_S - 1e-3f);
     SimResult r = simulate_hold_capped(cruise, accel, len, target_runway_for_mm(cruise, accel, len),
                                        blocks - 2, 3.0f);
     EXPECT_FALSE(r.ever_dipped) << "hold-sized blocks must pin the bench feed flat";
@@ -172,14 +187,15 @@ TEST(JogMathCapacity, HoldSizedBlocksHoldBenchFeed) {
 }
 
 TEST(JogMathCapacity, ExtremeFeedClampsToHoldable) {
-    // F30000 @ 100 mm/s^2: even 50mm blocks can't cover braking — the cruise must clamp to what
-    // the queue CAN hold, and at that clamped cruise the capacity covers 1.5 x braking.
+    // F30000 @ 100 mm/s^2: even 50mm blocks can't cover braking + slack — the cruise must clamp to
+    // what the queue CAN hold, and at that clamped cruise the capacity covers braking + v x slack.
     const int   blocks   = 16;
     const float holdable = max_holdable_feed_mm_min(100.0f, blocks);
     EXPECT_LT(holdable, 30000.0f);
     EXPECT_GT(holdable, 0.0f);
-    const float len = block_len_for_hold_mm(holdable, 100.0f, blocks);
-    EXPECT_GE(queue_capacity_mm(len, blocks), 1.5f * braking_distance_mm(holdable, 100.0f) - 1e-2f);
+    const float vmm_s = holdable * MM_MIN_TO_MM_S;
+    const float len   = block_len_for_hold_mm(holdable, 100.0f, blocks);
+    EXPECT_GE(queue_capacity_mm(len, blocks), braking_distance_mm(holdable, 100.0f) + vmm_s * LOOP_SLACK_S - 1e-2f);
     SimResult r = simulate_hold_capped(holdable, 100.0f, len, target_runway_for_mm(holdable, 100.0f, len),
                                        blocks - 2, 3.0f);
     EXPECT_FALSE(r.ever_dipped);

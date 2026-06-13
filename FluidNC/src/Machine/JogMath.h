@@ -35,12 +35,25 @@ namespace Machine {
             return std::min(50.0f, std::max(0.5f, v * 0.04f));
         }
 
+        // Loop-stall slack, in SECONDS of travel, added to the braking distance in the runway
+        // target. The queue must stay >= braking distance through the WORST protocol-loop pass
+        // (synchronous status TX of ~160-byte reports at 115200 blocks ~14 ms; CRC, acks, and
+        // bursts stack) or the planner legally decelerates — felt as velocity flutter that worsens
+        // with speed (slack is constant in distance, shrinking in TIME as v rises; the bench
+        // gradient: clean <=45%, shaky at 100%). 80 ms rides out stacked stalls with margin.
+        //
+        // This margin is FREE: it does NOT increase release overshoot, because $Jog/Stop and 0x85
+        // trigger the real jogCancel decel-in-place + flush (overshoot = v^2/2a, the physical
+        // minimum, independent of queue depth). Hold-robustness and stop-feel are decoupled.
+        constexpr float LOOP_SLACK_S = 0.08f;
+
         // Runway the refill loop keeps queued ahead of the executing point so the planner's
-        // tail-to-zero never reaches the front: max(1.5 x braking distance, 3 blocks).
+        // tail-to-zero never reaches the front: max(braking + v x slack, 3 blocks).
         inline float target_runway_mm(float feed_mm_min, float accel_mm_s2) {
+            float v            = feed_mm_min * MM_MIN_TO_MM_S;
             float brake        = braking_distance_mm(feed_mm_min, accel_mm_s2);
             float three_blocks = 3.0f * block_len_mm(feed_mm_min);
-            return std::max(1.5f * brake, three_blocks);
+            return std::max(brake + v * LOOP_SLACK_S, three_blocks);
         }
 
         // ── Queue-capacity sizing (fixes the high-feed velocity sag / jitter) ────────────────
@@ -63,34 +76,38 @@ namespace Machine {
         }
 
         // Block length sized so the queue can HOLD `feed`: the v*0.04s heuristic, raised when
-        // needed so (planner_blocks - 2) x len >= 1.5 x braking distance, clamped to [0.5, 50] mm.
+        // needed so (planner_blocks - 2) x len >= braking + v x slack, clamped to [0.5, 50] mm.
         inline float block_len_for_hold_mm(float feed_mm_min, float accel_mm_s2, int planner_blocks) {
             float v   = feed_mm_min * MM_MIN_TO_MM_S;
             float len = std::max(0.5f, v * 0.04f);
             int   n   = planner_blocks - 2;
             if (n > 0 && accel_mm_s2 > 0.0f) {
-                float need = (1.5f * braking_distance_mm(feed_mm_min, accel_mm_s2)) / float(n);
+                float need = (braking_distance_mm(feed_mm_min, accel_mm_s2) + v * LOOP_SLACK_S) / float(n);
                 len        = std::max(len, need);
             }
             return std::min(50.0f, len);
         }
 
-        // Highest cruise the queue can hold at the 50mm block-length cap: capacity >= 1.5 x brake
-        // inverted for v. Cruise above this is unreachable-by-construction; clamp to it.
+        // Highest cruise the queue can hold at the 50mm block-length cap: solve
+        // capacity >= v^2/2a + v x slack for v (quadratic; positive root). Cruise above this is
+        // unreachable-by-construction; clamp to it.
         inline float max_holdable_feed_mm_min(float accel_mm_s2, int planner_blocks) {
             int n = planner_blocks - 2;
             if (n <= 0 || accel_mm_s2 <= 0.0f) {
                 return 0.0f;
             }
             float cap = float(n) * 50.0f;
-            float v   = std::sqrt(2.0f * accel_mm_s2 * (cap / 1.5f));  // mm/s
-            return v / MM_MIN_TO_MM_S;
+            // v^2/(2a) + s*v - cap = 0  ->  v = a*(-s + sqrt(s^2 + 2*cap/a))
+            float s = LOOP_SLACK_S;
+            float v = accel_mm_s2 * (-s + std::sqrt(s * s + 2.0f * cap / accel_mm_s2));  // mm/s
+            return v > 0.0f ? v / MM_MIN_TO_MM_S : 0.0f;
         }
 
         // Runway target for a hold-sized block length (the 3-block floor uses the REAL length).
         inline float target_runway_for_mm(float feed_mm_min, float accel_mm_s2, float block_len) {
+            float v     = feed_mm_min * MM_MIN_TO_MM_S;
             float brake = braking_distance_mm(feed_mm_min, accel_mm_s2);
-            return std::max(1.5f * brake, 3.0f * block_len);
+            return std::max(brake + v * LOOP_SLACK_S, 3.0f * block_len);
         }
 
         // Fastest speed (mm/min) the machine can be moving at the front of the queue such that

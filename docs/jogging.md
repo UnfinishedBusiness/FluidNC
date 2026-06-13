@@ -31,9 +31,19 @@ a self-refilling planner feed.
 The planner always plans the last queued block to exit at zero velocity. The machine can
 therefore only *hold* feed `v` while at least the braking distance `v²/2a` stays queued
 ahead of the executing point. The refill loop keeps the queued runway at
-`max(1.5·v²/2a, 3 block-lengths)` every realtime tick, so the decel tail is never reached
-and the executing feed stays pinned at cruise. This is enforced as the acceptance test
+`max(v²/2a + v·LOOP_SLACK_S, 3 block-lengths)` every realtime tick, so the decel tail is
+never reached and the executing feed stays pinned at cruise. The additive `v·LOOP_SLACK_S`
+term (`LOOP_SLACK_S` = 80 ms) is the key: it keeps the queued runway above the braking
+distance through the *worst* protocol-loop pass (a synchronous status-report TX blocks the
+loop for ~14 ms at 115200; CRC/acks/bursts stack on top). A constant-distance margin shrinks
+in *time* as `v` rises — clean holds at ≤45% feed, velocity flutter at 100% — whereas a margin
+of `v·slack` seconds is flat in time at every speed. This is enforced as the acceptance test
 `FlatVelocityInvariant` in `tests/test_jog`.
+
+This margin is **free**: it does not increase release overshoot. `$Jog/Stop` and realtime
+`0x85` decelerate *in place* through the real jog-cancel path (overshoot = `v²/2a`, the
+physical minimum, independent of how much runway is queued), so the runway can carry generous
+loop-stall slack for a rock-solid hold without any penalty to stop feel.
 
 ## Configuration
 
@@ -179,8 +189,9 @@ Alarm:Unhomed — passive detection alone made the jog source nondeterministic a
 
 The planner ring holds `planner_blocks` (~16) entries; only `(planner_blocks − 2)` of runway can
 ever be queued. Jog blocks are therefore sized by `JogMath::block_len_for_hold_mm` so capacity
-covers **1.5 × braking distance** at the cruise, and `max_holdable_feed_mm_min` clamps the cruise
-when even 50 mm blocks can't cover it (extreme feed²/accel) — otherwise the queue saturates below
+covers **braking distance + `v·LOOP_SLACK_S`** at the cruise, and `max_holdable_feed_mm_min` clamps
+the cruise (solving `v²/2a + v·slack = capacity` for `v`) when even 50 mm blocks can't cover it
+(extreme feed²/accel) — otherwise the queue saturates below
 the velocity-hold threshold and the feed sags/oscillates exactly like host-streamed `$J=`
 (the original F15240 bench defect). Live queue health is reported as `|JogQ:<runway>,<target>`
 in the `?` status while a vector jog runs: runway pinned at/above target = flat velocity.

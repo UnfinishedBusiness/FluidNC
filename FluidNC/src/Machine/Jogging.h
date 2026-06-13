@@ -33,6 +33,11 @@ namespace Machine {
         Error startVector(const JogCommand::Vector& v, Channel& out);
         Error changeFeed(float feed_mm_min, Channel& out);
         Error stop(Channel& out);
+        // Realtime 0x85 while the firmware engine is active: same stop as $Jog/Stop's live branch
+        // — set _phase=Stopping (refill engine stands down) then jogCancel decel-in-place + flush.
+        // Runs in the pollLine/protocol task context, so it may mutate module state and trigger the
+        // cancel (set the suspend jogCancel bit) directly.
+        void stopFromRealtime();
 
         // $Shu/* command entry points (path-window shuttle mode).
         Error shuttleBegin(int total, Channel& out);
@@ -108,6 +113,11 @@ namespace Machine {
         float vectorAccel() const;
         // Compute _dirUnit from _vec; returns false if zero vector.
         bool  computeDirection();
+
+        // refill() is the re-entrancy-guarded shell (mc_linear -> protocol_execute_realtime re-enters);
+        // refillImpl() is the real body and must only run through the shell.
+        bool _inRefill = false;
+        void refillImpl();
 
         void refillVector(float cruise, float accel, float blockLen, float targetRunway, bool homed);
         void refillShuttle();

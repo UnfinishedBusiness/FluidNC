@@ -132,6 +132,8 @@ namespace Machine {
         }
         _cruise_mm_min = v.feed_mm_min;
         _kind          = Kind::Vector;  // fix sticky-kind: a vector jog after a shuttle session must dispatch to refillVector
+        log_info("JogStart received: X" << int(_vec[0]) << " Y" << int(_vec[1]) << " Z" << int(_vec[2]) << " F" << v.feed_mm_min
+                                        << " state=" << state_name());
 
         if (_phase == Phase::Stopping) {
             // A start during a cancel decel (rapid tap / quick reversal). Don't fight the flush —
@@ -172,6 +174,10 @@ namespace Machine {
     }
 
     Error Jogging::stop(Channel& out) {
+        // RX-proof diagnostic (bench runaway forensics): if this line appears, the command channel
+        // delivered the stop; if motion continues anyway the defect is downstream. If it NEVER
+        // appears while the host logged a $Jog/Stop TX, the link/channel is eating lines mid-Jog.
+        log_info("JogStop received: phase=" << static_cast<int>(_phase) << " state=" << state_name());
         if (_phase != Phase::Jogging) {
             return Error::Ok;
         }
@@ -180,8 +186,17 @@ namespace Machine {
         // (notably Idle during the start handoff) the blocks are queued but not yet running, so
         // flush them directly — leaving them would lurch the whole queued runway (v^2-scaled).
         if (JogLifecycle::stop_action(observedState()) == JogLifecycle::StopAction::CancelInflight) {
+            // RELEASE = the real jogCancel: decel IN PLACE at machine accel + flush the queued tail.
+            // Overshoot is exactly v^2/2a — the physical minimum, LinuxCNC-equal — INDEPENDENT of how
+            // much runway is queued. That independence is load-bearing: it lets the runway target
+            // carry generous loop-stall slack (JogMath::LOOP_SLACK_S) for rock-solid velocity hold
+            // without any release-feel penalty. (History: the bench runaway was NOT this path — it
+            // was the synchronous command dispatcher, fixed via AsyncUserCommand registration; the
+            // jogCancel decel machinery was proven good by bench feed-hold. The interim natural-stop
+            // design — cease refilling, land at the runway end — worked but coupled overshoot to the
+            // queue depth, capping the hold margin at the exact moment high feeds need more of it.)
             _phase = Phase::Stopping;
-            protocol_do_motion_cancel();  // flush queued jog + decel in place; refill finalizes at Idle
+            protocol_do_motion_cancel();  // state Jog -> protocol_cancel_jogging(): executeHold decel + flush
         } else {
             flushQueuedJog();      // drop queued-but-unstarted blocks; a stray cycle-start now hits an empty buffer
             onMotionTerminated();  // teardown (restores Alarm:Unhomed if this was the unhomed carve-out)
@@ -193,6 +208,21 @@ namespace Machine {
         onMotionTerminated();  // phase/lifecycle teardown
         _shuttleOpen = false;  // reset() additionally tears the shuttle session down
         _path.clear();
+    }
+
+    void Jogging::stopFromRealtime() {
+        if (_phase != Phase::Jogging) {
+            return;
+        }
+        // Identical to $Jog/Stop's live branch (jogCancel decel-in-place + flush), minus any
+        // pending resume — a panic byte means STOP, not "stop then continue".
+        _pendingDir        = 0;
+        _pendingVecRestart = false;
+        _shuttleDir        = 0;
+        _phase             = Phase::Stopping;
+        if (state_is(State::Jog)) {
+            protocol_do_motion_cancel();
+        }
     }
 
     void Jogging::beginPendingStart() {
@@ -230,6 +260,18 @@ namespace Machine {
     }
 
     void Jogging::refill() {
+        // Re-entrancy guard: mc_linear -> mc_move_motors calls protocol_execute_realtime, which calls
+        // refill() again — every queued block recursed one level deeper (stack-hungry at high feeds,
+        // double-queueing per tick). The outer pass does all the work; nested passes are no-ops.
+        if (_inRefill) {
+            return;
+        }
+        _inRefill = true;
+        refillImpl();
+        _inRefill = false;
+    }
+
+    void Jogging::refillImpl() {
         if (_phase != Phase::Jogging) {
             // When the cancel/decel has finished and we are back to Idle, finish up.
             if (_phase == Phase::Stopping && (state_is(State::Idle) || state_is(State::Alarm))) {

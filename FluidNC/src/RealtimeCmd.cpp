@@ -5,6 +5,10 @@
 #include "Report.h"
 #include "System.h"
 #include "Machine/Macros.h"  // macroNEvent
+#ifdef ENABLE_FW_JOG
+#    include "Machine/MachineConfig.h"  // config->_jogging
+#    include "Machine/Jogging.h"
+#endif
 
 // Act upon a realtime character
 void execute_realtime_command(Cmd command, Channel& channel) {
@@ -26,6 +30,20 @@ void execute_realtime_command(Cmd command, Channel& channel) {
             protocol_send_event(&safetyDoorEvent);
             break;
         case Cmd::JogCancel:
+#ifdef ENABLE_FW_JOG
+            // A firmware-engine jog stops via stopFromRealtime(): identical to $Jog/Stop's live
+            // branch — set _phase=Stopping so the refill engine stops queuing, then jogCancel
+            // decel-in-place + flush (overshoot = v^2/2a, the physical minimum). Do NOT send the
+            // stock motionCancelEvent here: that cancels the in-flight motion WITHOUT telling the
+            // refill engine to stand down, so it keeps queuing blocks against the cancel — that
+            // (not the jogCancel decel itself) was the bench channel-dead runaway, since fully
+            // fixed by also registering $Jog/* as AsyncUserCommand. Legacy $J= jogs (module not
+            // active) keep the stock event.
+            if (config && config->_jogging && config->_jogging->active()) {
+                config->_jogging->stopFromRealtime();
+                break;
+            }
+#endif
             if (state_is(State::Jog)) {  // Block all other states from invoking motion cancel.
                 protocol_send_event(&motionCancelEvent);
             }
