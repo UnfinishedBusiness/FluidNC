@@ -9,9 +9,11 @@
 #include "../Protocol.h"       // protocol_auto_cycle_start, protocol_do_motion_cancel, lastAlarm
 #include "../GCode.h"          // gc_state
 #include "../System.h"         // get_mpos, state_is, sys_motion_ending
+#include "../Limit.h"          // limitsMinPosition, limitsMaxPosition
 #include "../Channel.h"
 #include "../Logging.h"  // LogStream, log_*, setprecision
 #include "JogMath.h"
+#include "JogIntegrator.h"
 #include "JogLifecycle.h"
 #include "Homing.h"
 
@@ -22,6 +24,11 @@ namespace Machine {
 
     // Sentinel line number on synthesized jog blocks (kept out of the program line space).
     static constexpr int32_t JOG_LINE = -1;
+
+    // Virtual-time step the velocity-setpoint integrator advances per sub-iteration. The refill loop
+    // runs at ~1 kHz (vTaskDelay(1)); 1 ms is finer than GcodePilot's 2 ms host substep, so a single
+    // integration per sub-iteration is accurate without sub-stepping.
+    static constexpr float JOG_TICK_S = 0.001f;
 
     // Refill ticks to tolerate State::Idle after issuing a cycle start before the state flips to
     // Jog. The handoff is normally 1 tick; this bounds a start that never takes (e.g. a jog that
@@ -246,6 +253,7 @@ namespace Machine {
         _shuttleDir        = 0;
         _pendingDir        = 0;      // a hard termination cancels any pending shuttle reversal/resume
         _pendingVecRestart = false;  // ... and any vector restart queued during a decel
+        resetIntegrator();           // next vector jog re-seeds the trajectory from the machine position
         if (_shuttleOpen) {
             _reseedOnRun = true;  // re-project the commanded position on the next shuttle jog
         }
@@ -276,6 +284,7 @@ namespace Machine {
             // When the cancel/decel has finished and we are back to Idle, finish up.
             if (_phase == Phase::Stopping && (state_is(State::Idle) || state_is(State::Alarm))) {
                 _phase = Phase::Idle;
+                resetIntegrator();  // the decel finished; a restart below re-seeds the trajectory
                 // Unhomed round-trip: a jog that started from Alarm:Unhomed returns there (NOT Idle)
                 // so program-start homing enforcement and the host's homing badge stay truthful.
                 if (_entryUnhomed && state_is(State::Idle)) {
@@ -340,67 +349,127 @@ namespace Machine {
             if (cruise <= 0.0f) {
                 return;
             }
-            // Queue-capacity closure (see JogMath.h): cap the cruise to what the planner ring can
-            // physically HOLD, and size blocks so capacity covers 1.5x braking — otherwise high
-            // feeds saturate the queue below the velocity-hold threshold and the feed sags and
-            // oscillates (the bench "jitters like $J=" defect at F15240).
+            // Cap the cruise to what the planner ring can physically HOLD flat at this accel — a
+            // slightly slower jog that holds velocity beats a faster setpoint the queue can never
+            // sustain (it would saturate below the hold threshold and oscillate like streamed $J=).
             float accel  = vectorAccel();
             int   blocks = config->_planner_blocks;
-            cruise       = std::min(cruise, JogMath::max_holdable_feed_mm_min(accel, blocks));
-            float len    = JogMath::block_len_for_hold_mm(cruise, accel, blocks);
-            refillVector(cruise, accel, len, JogMath::target_runway_for_mm(cruise, accel, len), !unhomedJogExceptionActive());
+            cruise       = std::min(cruise, JogIntegrator::max_holdable_feed_mm_min(accel, blocks));
+            // Extents are enforced per-axis on Axis::_softLimits, NOT on homing: a soft-limits-on
+            // machine with homing-not-required (known boot position) gets full envelope protection,
+            // while the Alarm:Unhomed free-jog carve-out (position genuinely unknown) gets none so
+            // the operator can drive toward the switches. The per-axis _softLimits gate is applied
+            // inside refillVector via constrain_jog and the integrator fences.
+            refillVector(cruise, accel, !unhomedJogExceptionActive());
         }
     }
 
-    void Jogging::refillVector(float cruise, float accel, float blockLen, float targetRunway, bool homed) {
-        int queued     = 0;
-        _lastRunwayMm  = 0.0f;
-        _lastTargetMm  = targetRunway;
-        while (_phase == Phase::Jogging && plan_get_block_buffer_available() > 1) {
-            // Runway = projection of (commanded - machine) onto the jog direction.
-            float* mpos   = get_mpos();
-            float  runway = 0.0f;
-            for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-                runway += (gc_state.position[a] - mpos[a]) * _dirUnit[a];
+    void Jogging::refillVector(float cruise, float accel, bool enforceExtents) {
+        // Seed the trajectory edge at the current commanded position on the first tick of a jog
+        // (and after every teardown, which clears _integ). gc_state.position == mpos at start.
+        if (!_integ.primed) {
+            JogIntegrator::seed(_integ, gc_state.position);
+        }
+        // Update the velocity setpoint from the current direction + clamped cruise. A direction or
+        // feed change mid-jog just lands here again; the integrator blends toward the new vector.
+        JogIntegrator::set_target(_integ, _dirUnit, cruise);
+
+        // Build the per-axis soft-limit envelope (absolute machine mm). Gate on Axis::_softLimits —
+        // NOT on homing — so soft-limits-on machines get extents whether or not homing is required;
+        // pass no fence for the unhomed free-jog carve-out (enforceExtents=false, position unknown)
+        // and for axes with soft limits off (large sentinel).
+        float        limMin[3], limMax[3];
+        const float* pMin = nullptr;
+        const float* pMax = nullptr;
+        if (enforceExtents) {
+            for (int a = 0; a < 3; ++a) {
+                auto ax = (a < Axes::_numberAxis) ? config->_axes->_axis[a] : nullptr;
+                if (ax && ax->_softLimits) {
+                    limMin[a] = limitsMinPosition(axis_t(a));
+                    limMax[a] = limitsMaxPosition(axis_t(a));
+                } else {
+                    limMin[a] = -1.0e9f;
+                    limMax[a] = 1.0e9f;
+                }
             }
-            _lastRunwayMm = runway;  // live queue health for the |JogQ status field
-            if (runway >= targetRunway) {
+            pMin = limMin;
+            pMax = limMax;
+        }
+
+        // Integrate the trajectory forward and emit waypoints until the queued lead reaches the
+        // committed-lead target (>= braking distance, so the executing feed holds flat) or the
+        // planner ring is full. The integrator carries velocity across ticks, so this races ahead
+        // to (re)fill the lead, then later ticks just top up the few mm execution has drained.
+        int queued = 0;
+        while (_phase == Phase::Jogging && plan_get_block_buffer_available() > 1) {
+            float* mpos       = get_mpos();
+            float  queuedLead = 0.0f;  // distance already queued in the planner ahead of execution
+            for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
+                float d = gc_state.position[a] - mpos[a];
+                queuedLead += d * d;
+            }
+            queuedLead    = std::sqrt(queuedLead);
+            float vmag    = JogIntegrator::speed(_integ);
+            float lead    = JogIntegrator::committed_lead_mm(vmag, accel);
+            _lastRunwayMm = queuedLead;  // |JogQ: queued lead ...
+            _lastTargetMm = lead;        // ... , committed-lead target
+            // Paced: enough queued, and we are actually moving (so we don't stall the ramp at rest).
+            if (queuedLead >= lead && JogIntegrator::moving(_integ)) {
+                break;
+            }
+            // If the setpoint is zero and we have coasted to rest, there is nothing left to queue.
+            if (!JogIntegrator::moving(_integ) && cruise <= 0.0f) {
                 break;
             }
 
-            // Next target = current commanded position + dir * blockLen.
+            JogIntegrator::integrate_tick(_integ, accel, JOG_TICK_S, pMin, pMax);
+            vmag = JogIntegrator::speed(_integ);
+            if (!JogIntegrator::should_emit(_integ, vmag)) {
+                continue;  // keep integrating; not enough accumulated for a useful waypoint yet
+            }
+
+            // Emit a waypoint at the integrated trajectory edge, at the CURRENT ramped speed.
             float target[MAX_N_AXIS];
             copyAxes(target, gc_state.position);
             for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-                target[a] += _dirUnit[a] * blockLen;
+                target[a] = _integ.pos[a];
             }
 
             plan_line_data_t pl;
             memset(&pl, 0, sizeof(pl));
-            pl.feed_rate             = cruise;
+            pl.feed_rate             = std::max(1.0f, vmag * JogIntegrator::MM_S_TO_MM_MIN);
             pl.motion.noFeedOverride = 1;
             pl.is_jog                = true;
             pl.line_number           = JOG_LINE;
 
-            if (homed) {
-                // Clamp to the soft-limit envelope; a zero-length result means we hit the fence.
+            if (enforceExtents) {
+                // Belt-and-suspenders: the integrator already clamps to the fence, but re-clamp the
+                // emitted block (the same per-axis _softLimits gate constrain_jog applies).
                 config->_kinematics->constrain_jog(target, &pl, gc_state.position);
-                float moved2 = 0.0f;
-                for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-                    float d = target[a] - gc_state.position[a];
-                    moved2 += d * d;
-                }
-                if (moved2 < 1e-8f) {
-                    break;  // parked on the boundary; planner tail-to-zero holds us there
-                }
             } else {
-                pl.limits_checked = true;  // no envelope when unhomed
+                pl.limits_checked = true;  // no envelope (unhomed free-jog carve-out)
+            }
+
+            float moved2 = 0.0f;
+            for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
+                float d = target[a] - gc_state.position[a];
+                moved2 += d * d;
+            }
+            if (moved2 < 1e-10f) {
+                // Parked on a fence (constrain_jog zeroed the move): keep the trajectory edge at the
+                // clamped position so the integrator's own fence math agrees, and stop queueing.
+                for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
+                    _integ.pos[a] = gc_state.position[a];
+                }
+                JogIntegrator::note_emitted(_integ, vmag);
+                break;
             }
 
             if (!mc_linear(target, &pl, gc_state.position)) {
                 break;  // jog cancelled in-flight
             }
             copyAxes(gc_state.position, target);  // advance commanded position (mirrors jog_execute)
+            JogIntegrator::note_emitted(_integ, vmag);
             ++queued;
         }
 

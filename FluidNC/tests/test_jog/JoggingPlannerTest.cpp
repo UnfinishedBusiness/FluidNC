@@ -18,6 +18,7 @@ extern const EnumItem messageLevels2[];
 #include "Protocol.h"
 #include "System.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -38,6 +39,23 @@ namespace {
 
     Channel& fakeChannel() {
         return *reinterpret_cast<Channel*>(0x1);
+    }
+
+    // The velocity-setpoint engine RAMPS the emitted feed (first block slow, climbing to the
+    // clamped cruise), so assertions check the ramp's plateau / ceiling rather than a fixed feed.
+    float maxPlannedFeed() {
+        float m = 0.0f;
+        for (auto& l : plannedLines) {
+            m = std::max(m, l.feed);
+        }
+        return m;
+    }
+    float minPlannedFeed() {
+        float m = 1e30f;
+        for (auto& l : plannedLines) {
+            m = std::min(m, l.feed);
+        }
+        return plannedLines.empty() ? 0.0f : m;
     }
 }
 
@@ -211,6 +229,22 @@ namespace {
             jogging.refill();                    // observes Jog: keeps the runway topped up
             ASSERT_TRUE(jogging.active());
         }
+
+        // Model the planner draining: advance the executed position toward the commanded edge a
+        // little each tick and refill, so the velocity-setpoint integrator keeps ramping toward the
+        // setpoint over many refills (the firmware sees real execution; the static-mpos harness
+        // would otherwise pin the lead and stop integrating).
+        void simulateExecution(int ticks) {
+            for (int i = 0; i < ticks; ++i) {
+                for (axis_t a = X_AXIS; a < Machine::Axes::_numberAxis; ++a) {
+                    float d    = gc_state.position[a] - testMpos[a];
+                    float step = 0.25f;  // mm of execution per tick
+                    testMpos[a] += (d > step) ? step : (d < -step ? -step : d);
+                }
+                testState = State::Jog;
+                jogging.refill();
+            }
+        }
     };
 
     // ---- Runaway acceptance matrix: every termination path must queue NOTHING more ----
@@ -299,7 +333,8 @@ namespace {
         // A vector jog must now dispatch to the VECTOR refill (sticky-kind bug would leave it dead).
         ASSERT_EQ(startX(6000.0f), Error::Ok);
         EXPECT_FALSE(plannedLines.empty());
-        EXPECT_FLOAT_EQ(plannedLines.front().feed, 6000.0f);
+        EXPECT_NEAR(maxPlannedFeed(), 6000.0f, 1.0f);  // ramp reaches the commanded cruise
+        EXPECT_LE(maxPlannedFeed(), 6000.0f + 1.0f);   // and never exceeds it
     }
 
     TEST_F(JoggingPlannerTest, HomingDisabledDoesNotApplyUnhomedFeedCap) {
@@ -309,8 +344,7 @@ namespace {
 
         ASSERT_EQ(startX(6000.0f), Error::Ok);
         ASSERT_FALSE(plannedLines.empty());
-        EXPECT_FLOAT_EQ(plannedLines.front().feed, 6000.0f);
-        EXPECT_NE(plannedLines.front().feed, 1000.0f);
+        EXPECT_NEAR(maxPlannedFeed(), 6000.0f, 1.0f);  // no cap: ramp reaches the full cruise
     }
 
     TEST_F(JoggingPlannerTest, AlarmUnhomedAllowedJogAppliesUnhomedFeedCap) {
@@ -322,8 +356,9 @@ namespace {
 
         ASSERT_EQ(startX(6000.0f), Error::Ok);
         ASSERT_FALSE(plannedLines.empty());
-        EXPECT_FLOAT_EQ(plannedLines.front().feed, 1000.0f);
-        EXPECT_TRUE(plannedLines.front().limits_checked);
+        EXPECT_LE(maxPlannedFeed(), 1000.0f + 1.0f);   // capped: the ramp never exceeds the unhomed cap
+        EXPECT_NEAR(maxPlannedFeed(), 1000.0f, 1.0f);  // and reaches it
+        EXPECT_TRUE(plannedLines.front().limits_checked);  // no soft-limit envelope while unhomed
     }
 
     TEST_F(JoggingPlannerTest, HomedIdleJogDoesNotApplyUnhomedFeedCap) {
@@ -332,24 +367,44 @@ namespace {
 
         ASSERT_EQ(startX(6000.0f), Error::Ok);
         ASSERT_FALSE(plannedLines.empty());
-        EXPECT_FLOAT_EQ(plannedLines.front().feed, 6000.0f);
-        EXPECT_NE(plannedLines.front().feed, 1000.0f);
+        EXPECT_NEAR(maxPlannedFeed(), 6000.0f, 1.0f);
     }
 
     TEST_F(JoggingPlannerTest, LiveFeedChangeRefillsWithNewFeedForSameVector) {
         setHomingEnabled(true);
 
         ASSERT_EQ(startX(6000.0f), Error::Ok);
-        ASSERT_FALSE(plannedLines.empty());
-
-        for (axis_t axis = X_AXIS; axis < Machine::Axes::_numberAxis; ++axis) {
-            testMpos[axis] = gc_state.position[axis];
-        }
-        plannedLines.clear();
+        simulateExecution(400);  // ramp up and settle at the commanded cruise
+        EXPECT_NEAR(maxPlannedFeed(), 6000.0f, 1.0f);
 
         ASSERT_EQ(jogging.changeFeed(3000.0f, fakeChannel()), Error::Ok);
+        plannedLines.clear();
+        simulateExecution(600);  // integrator ramps DOWN to the new setpoint and holds there
         ASSERT_FALSE(plannedLines.empty());
-        EXPECT_FLOAT_EQ(plannedLines.front().feed, 3000.0f);
+        EXPECT_NEAR(plannedLines.back().feed, 3000.0f, 100.0f);  // settled at the new feed
+        EXPECT_GE(minPlannedFeed(), 3000.0f - 100.0f);            // ramped toward it, never under
+    }
+
+    // Direction change mid-jog must BLEND the velocity vector (no stop/flush): a +X jog re-issued
+    // as +Y emits Y motion while still moving, without a protocol_flush_queued_jog (the old engine
+    // would hard-corner / requeue). The smooth arc is verified at the math layer (JogIntegratorTest).
+    TEST_F(JoggingPlannerTest, DirectionChangeMidJogBlendsWithoutFlush) {
+        establishJog(6000.0f);
+        simulateExecution(200);  // settle moving along +X
+        int flushBefore = flushCount;
+
+        Machine::JogCommand::Vector v;
+        v.axis[1]     = 1;  // now +Y (drop X)
+        v.feed_mm_min = 6000.0f;
+        ASSERT_EQ(jogging.startVector(v, fakeChannel()), Error::Ok);
+        EXPECT_EQ(flushCount, flushBefore) << "a direction change must not flush — it blends";
+
+        size_t before = plannedLines.size();
+        simulateExecution(400);
+        ASSERT_GT(plannedLines.size(), before);
+        // The newest waypoints carry Y motion (the blended vector swung toward +Y).
+        EXPECT_GT(plannedLines.back().target[Y_AXIS], plannedLines.front().target[Y_AXIS]);
+        EXPECT_TRUE(jogging.active());
     }
 }
 

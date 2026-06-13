@@ -26,24 +26,43 @@ The engine does **not** bypass the planner or drive the steppers directly — it
 **existing planner/stepper path** (compatible with RMT and I2S stepping). This is "Route A":
 a self-refilling planner feed.
 
+### LinuxCNC-style velocity-setpoint trajectory
+
+The engine is a **per-axis trapezoidal velocity integrator** (`JogMath` companion
+`JogIntegrator.h`), ported from the proven host-side jog planner. Each refill tick it slews a
+per-axis velocity vector toward `direction × cruise` at the axis acceleration limit, integrates
+position, and emits the integrated path as short jog blocks (waypoints) into the planner. The
+ramp lives **in the engine, in time** — *not* in the planner's lookahead — which is what gives
+the LinuxCNC feel:
+
+- **A quick tap makes a small move.** Velocity only ramps for as long as the key is held, so a
+  tap integrates a brief ramp and stops — the move scales with press time, not with any fixed
+  block/runway size. (The old engine committed a full-cruise runway up front, so a tap lurched
+  ~`v²/2a` at full speed.)
+- **Cornering sweeps a smooth arc.** A direction change re-aims the setpoint; the velocity
+  *vector* slews per axis (ramping through zero on a reversal), so the resultant traces a blended
+  arc instead of an angular "S-curve." Waypoints are emitted denser through the turn so the
+  planner's junction-deviation never forces a near-stop.
+
 ### The flat-velocity invariant
 
 The planner always plans the last queued block to exit at zero velocity. The machine can
-therefore only *hold* feed `v` while at least the braking distance `v²/2a` stays queued
-ahead of the executing point. The refill loop keeps the queued runway at
-`max(v²/2a + v·LOOP_SLACK_S, 3 block-lengths)` every realtime tick, so the decel tail is
-never reached and the executing feed stays pinned at cruise. The additive `v·LOOP_SLACK_S`
-term (`LOOP_SLACK_S` = 80 ms) is the key: it keeps the queued runway above the braking
-distance through the *worst* protocol-loop pass (a synchronous status-report TX blocks the
-loop for ~14 ms at 115200; CRC/acks/bursts stack on top). A constant-distance margin shrinks
-in *time* as `v` rises — clean holds at ≤45% feed, velocity flutter at 100% — whereas a margin
-of `v·slack` seconds is flat in time at every speed. This is enforced as the acceptance test
-`FlatVelocityInvariant` in `tests/test_jog`.
+therefore only *hold* feed `v` while at least the braking distance `v²/2a` stays queued ahead of
+the executing point. The engine paces emission to keep the **committed lead** —
+`v²/2a + v·LEAD_MARGIN_S` (`LEAD_MARGIN_S` = 80 ms), clamped to a sane window — queued ahead at
+the *current* speed every tick, so the decel tail is never reached and the executing feed stays
+pinned at cruise. The additive `v·LEAD_MARGIN_S` rides out the worst protocol-loop pass (a
+synchronous status-report TX blocks the loop ~14 ms at 115200; CRC/acks/bursts stack on top); it
+is a margin in *time*, flat at every speed (a constant-distance margin would shrink in time as
+`v` rises — clean holds at low feed, flutter at 100%). `max_holdable_feed_mm_min` clamps the
+commanded cruise to what the planner ring can physically hold flat, so a too-fast setpoint
+becomes a slightly slower jog that *holds* rather than one that oscillates. Validated by
+`JogIntegratorTest` (flat hold, plus the tap/blend/release/extent gates) in `tests/test_jog`.
 
-This margin is **free**: it does not increase release overshoot. `$Jog/Stop` and realtime
-`0x85` decelerate *in place* through the real jog-cancel path (overshoot = `v²/2a`, the
-physical minimum, independent of how much runway is queued), so the runway can carry generous
-loop-stall slack for a rock-solid hold without any penalty to stop feel.
+This margin is **free**: it does not increase release overshoot. `$Jog/Stop` and realtime `0x85`
+decelerate *in place* through the real jog-cancel path — a smooth, acceleration-limited
+deceleration that flushes the queued lead, so overshoot is exactly `v²/2a` (the physical minimum)
+*independent* of how much runway is queued. Hold-robustness and stop-feel stay decoupled.
 
 ## Configuration
 
@@ -69,19 +88,29 @@ All feeds are **mm/min** and coordinates **mm**, independent of `G20/G21`.
 
 | Command | Meaning |
 |---------|---------|
-| `$Jog/Start=X<±1\|0> Y<±1\|0> Z<±1\|0> F<mm/min>` | Begin/redirect a held jog along the given direction (each axis −1/0/+1; ≥1 nonzero; F required). |
-| `$Jog/Feed=<mm/min>` | Change the held feed in place (no-op if not jogging). |
-| `$Jog/Stop` | Decelerate to a stop. |
-| realtime `0x85` | Cancel (same as `$Jog/Stop`, immediate). |
+| `$Jog/Start=X<±1\|0> Y<±1\|0> Z<±1\|0> F<mm/min>` | Begin/redirect a held jog. Re-issued mid-jog with a new vector, the velocity **blends** to the new direction (smooth arc). |
+| `$Jog/Feed=<mm/min>` | Change the held feed in place; velocity ramps to the new cruise (no-op if not jogging). |
+| `$Jog/Stop` | Decelerate to a stop (smooth, acceleration-limited; overshoot `v²/2a`). |
+| realtime `0x85` | Immediate cancel — same smooth in-place decel as `$Jog/Stop` (panic path). |
 
 Allowed states: `Idle`, `Jog` (re-issue `Start` to change direction mid-jog), or the
 `Alarm:Unhomed` carve-out above. A disallowed state returns `error:9`; a malformed
 vector/feed returns `error:3`.
 
 The cruise feed is clamped so no active axis exceeds its `max_rate` along the vector
-(`feed ≤ min(max_rate[a]/|dir[a]|)`), then the unhomed cap is applied. When homed, each
-queued block is constrained to the soft-limit envelope; on reaching a fence the engine
-parks against it (the planner tail-to-zero holds position) rather than overrunning.
+(`feed ≤ min(max_rate[a]/|dir[a]|)`), then the unhomed cap (if applicable) and the
+queue-holdable cap are applied.
+
+### Machine extents
+
+Extent enforcement is keyed on each axis's **`soft_limits`** setting — **not** on homing.
+A machine with `soft_limits` on but homing not required (known boot position) gets full
+envelope protection; the integrator **proactively decelerates and parks an axis exactly at its
+soft-limit boundary** (`v²/2a` vs. distance-to-fence), so a jog into a limit stops smoothly at
+the fence instead of slamming or overrunning. On a diagonal, the axis that reaches its limit
+parks while the others keep moving — the jog slides along the fence. The **sole** no-envelope
+case is the `allow_unhomed` `Alarm:Unhomed` carve-out, where the position is genuinely unknown
+and you must be able to jog toward the homing switches; there the feed cap is the only guard.
 
 ## Path shuttle (`$Shu/*`)
 
@@ -188,13 +217,13 @@ Alarm:Unhomed — passive detection alone made the jog source nondeterministic a
 ## Velocity hold & queue capacity
 
 The planner ring holds `planner_blocks` (~16) entries; only `(planner_blocks − 2)` of runway can
-ever be queued. Jog blocks are therefore sized by `JogMath::block_len_for_hold_mm` so capacity
-covers **braking distance + `v·LOOP_SLACK_S`** at the cruise, and `max_holdable_feed_mm_min` clamps
-the cruise (solving `v²/2a + v·slack = capacity` for `v`) when even 50 mm blocks can't cover it
-(extreme feed²/accel) — otherwise the queue saturates below
-the velocity-hold threshold and the feed sags/oscillates exactly like host-streamed `$J=`
-(the original F15240 bench defect). Live queue health is reported as `|JogQ:<runway>,<target>`
-in the `?` status while a vector jog runs: runway pinned at/above target = flat velocity.
+ever be queued. The integrator emits speed-scaled waypoints (longer at cruise, capped at
+`SEG_MAX_MM`) and `JogIntegrator::max_holdable_feed_mm_min` clamps the commanded cruise to the
+fastest speed whose committed lead (`v²/2a + v·LEAD_MARGIN_S`) the ring can hold — beyond it the
+queue would saturate below the hold threshold and the feed would sag/oscillate like host-streamed
+`$J=` (the original F15240 bench defect). Live queue health is reported as
+`|JogQ:<queued-lead>,<committed-lead>` in the `?` status while a vector jog runs: queued lead
+pinned at/above the committed-lead target = flat velocity.
 
 A `$Jog/Start` arriving during a cancel decel (rapid tap, quick reversal) is queued as a pending
 restart and re-armed from the Stopping finalizer at clean Idle — never dropped, never fighting

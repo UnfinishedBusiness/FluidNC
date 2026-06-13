@@ -5,6 +5,7 @@
 
 #include "Configuration/Configurable.h"
 #include "JogCommand.h"
+#include "JogIntegrator.h"  // velocity-setpoint trajectory state for vector jogs
 #include "ShuttlePath.h"
 #include "../Error.h"
 #include "../Config.h"  // MAX_N_AXIS
@@ -84,7 +85,12 @@ namespace Machine {
         int8_t _pendingVec[3]     = { 0, 0, 0 };
         float  _pendingVecFeed    = 0.0f;
 
-        // Live queue health for the |JogQ status field (set by refillVector each pass).
+        // Velocity-setpoint trajectory for vector jogs (LinuxCNC-style ramp/blend; see JogIntegrator.h).
+        // Carried across direction/feed changes (the integrator blends); reset on every teardown.
+        JogIntegrator::State _integ;
+
+        // Live queue health for the |JogQ status field (set by refillVector each pass):
+        // queued lead (mm in planner ahead of the executing point) and the committed-lead target.
         float _lastRunwayMm = 0.0f;
         float _lastTargetMm = 0.0f;
 
@@ -119,7 +125,12 @@ namespace Machine {
         bool _inRefill = false;
         void refillImpl();
 
-        void refillVector(float cruise, float accel, float blockLen, float targetRunway, bool homed);
+        // Vector refill: integrate the velocity-setpoint trajectory and emit waypoints to keep the
+        // queued lead at the committed-lead target. enforceExtents gates the per-axis soft-limit
+        // envelope (keyed on Axis::_softLimits, NOT on homing — see refillImpl).
+        void refillVector(float cruise, float accel, bool enforceExtents);
+        // Reset the velocity-setpoint trajectory so the next jog re-seeds from the machine position.
+        void resetIntegrator() { _integ = JogIntegrator::State {}; }
         void refillShuttle();
         // Limiting acceleration over the XY axes (shuttle moves in the XY plane).
         float shuttleAccel() const;
