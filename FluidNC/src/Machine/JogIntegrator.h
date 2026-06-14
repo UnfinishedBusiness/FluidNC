@@ -123,10 +123,22 @@ namespace Machine {
             for (int a = 0; a < 3; ++a) {
                 float target = s.targetVel[a];
                 if (limMin && limMax && accel > 0.0f) {
-                    float distToFence = (s.vel[a] >= 0.0f) ? (limMax[a] - s.pos[a]) : (s.pos[a] - limMin[a]);
-                    float stopDist    = (s.vel[a] * s.vel[a]) / (2.0f * accel);
-                    if (stopDist >= distToFence) {
-                        target = 0.0f;  // can't stop before the fence at this speed — aim to stop now
+                    float stopDist = (s.vel[a] * s.vel[a]) / (2.0f * accel);
+                    // Proactive decel: only when actually MOVING toward a fence and unable to stop
+                    // before it. Keyed on the velocity sign — NOT a bare >=0, which at rest (vel==0)
+                    // would always pick the max fence and wrongly block a jog heading the other way
+                    // (e.g. parked at the max corner, jogging back into the envelope).
+                    if (s.vel[a] > 0.0f && stopDist >= (limMax[a] - s.pos[a])) {
+                        target = 0.0f;
+                    } else if (s.vel[a] < 0.0f && stopDist >= (s.pos[a] - limMin[a])) {
+                        target = 0.0f;
+                    }
+                    // Don't ramp INTO a fence we're already sitting on (from rest): cancel a setpoint
+                    // that points further past the boundary, but still allow motion back into range.
+                    if (s.pos[a] >= limMax[a] && target > 0.0f) {
+                        target = 0.0f;
+                    } else if (s.pos[a] <= limMin[a] && target < 0.0f) {
+                        target = 0.0f;
                     }
                 }
                 float dv = accel * dt;

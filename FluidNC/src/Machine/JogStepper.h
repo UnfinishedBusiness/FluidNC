@@ -31,6 +31,11 @@ namespace Machine {
 
         static bool active() { return _active; }
 
+        // Current jog speed (mm/min) — the magnitude of the published velocity vector. Reported as
+        // the `|FS:` feed in the `?` status while a direct jog runs (the planner, which normally
+        // supplies that, is bypassed). The DDA emits steps at exactly this rate.
+        static float currentRateMmMin() { return _rateMmMin; }
+
         // Highest cruise (mm/min) the DDA can emit along `dirUnit` without owing >1 step/axis/tick
         // (i.e. without the integrator outrunning the steppers). Caller clamps cruise to this.
         static float maxCruiseMmMin(const float dirUnit[MAX_N_AXIS]);
@@ -57,5 +62,6 @@ namespace Machine {
         static volatile bool    _active;
         static volatile int32_t _inc[MAX_N_AXIS];  // signed steps per tick, Q16 (sign = travel dir)
         static int32_t          _acc[MAX_N_AXIS];   // ISR-private fractional-step accumulator (Q16)
+        static volatile float   _rateMmMin;         // |velocity| (mm/min) for the |FS: status field
     };
 }

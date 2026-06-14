@@ -787,6 +787,13 @@ void Stepper::prep_buffer() {
 // in the segment buffer. It will always be behind by up to the number of segment blocks (-1)
 // divided by the ACCELERATION TICKS PER SECOND in seconds.
 float Stepper::get_realtime_rate() {
+#ifdef ENABLE_FW_JOG
+    // A direct-stepper jog bypasses the planner, so prep.current_speed is stale. Report the jog
+    // engine's commanded velocity (the rate the DDA is actually stepping at) for the |FS: field.
+    if (Machine::JogStepper::active()) {
+        return Machine::JogStepper::currentRateMmMin();
+    }
+#endif
     switch (sys.state()) {
         case State::Cycle:
         case State::Homing:

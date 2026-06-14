@@ -18,6 +18,7 @@ namespace Machine {
     volatile bool    JogStepper::_active           = false;
     volatile int32_t JogStepper::_inc[MAX_N_AXIS]  = { 0 };
     int32_t          JogStepper::_acc[MAX_N_AXIS]  = { 0 };
+    volatile float   JogStepper::_rateMmMin        = 0.0f;
 
     float JogStepper::maxCruiseMmMin(const float dirUnit[MAX_N_AXIS]) {
         // The fastest axis (|dir|*steps_per_mm largest) must stay <= JOG_STEP_HZ steps/s. Solve for
@@ -38,6 +39,10 @@ namespace Machine {
     }
 
     void JogStepper::setVelocity(const float vel_mm_s[3]) {
+        // Publish the speed (mm/min) for the |FS: status field.
+        float v2   = vel_mm_s[0] * vel_mm_s[0] + vel_mm_s[1] * vel_mm_s[1] + vel_mm_s[2] * vel_mm_s[2];
+        _rateMmMin = std::sqrt(v2) * 60.0f;
+
         auto axes = config->_axes;
         for (int a = 0; a < MAX_N_AXIS; ++a) {
             float v   = (a < 3) ? vel_mm_s[a] : 0.0f;  // vector jog is XYZ only; higher axes never step
@@ -97,7 +102,8 @@ namespace Machine {
         if (!_active) {
             return;
         }
-        _active = false;
+        _active    = false;
+        _rateMmMin = 0.0f;
         Stepper::go_idle();   // stop the timer (no more isr_compute), schedule idle-disable per config
         // axis_steps[] is now final; make the planner + gcode parser agree with it so the next move
         // starts from the true stopped position (the homing / jog-cancel resync recipe).
