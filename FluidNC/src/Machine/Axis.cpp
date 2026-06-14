@@ -9,7 +9,9 @@ namespace Machine {
         handler.item("steps_per_mm", _stepsPerMm, 0.001, 100000.0);
         handler.item("max_rate_mm_per_min", _maxRate, 0.001, 250000.0);
         handler.item("acceleration_mm_per_sec2", _acceleration, 0.001, 100000.0);
-        handler.item("max_travel_mm", _maxTravel, 0.1, 10000000.0);
+        // Signed: magnitude = travel distance, sign = travel direction from home/boot. The sign is
+        // the soft-limit envelope direction when there is no homing block (see limitsMaxPosition()).
+        handler.item("max_travel_mm", _maxTravel, -10000000.0, 10000000.0);
         handler.item("soft_limits", _softLimits);
         handler.item("idle_disable", _idleDisable);
         handler.section("homing", _homing);

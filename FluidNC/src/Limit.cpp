@@ -14,6 +14,7 @@
 #include <freertos/task.h>
 #include <freertos/queue.h>
 #include <atomic>  // fence
+#include <cmath>   // fabsf
 
 QueueHandle_t limit_sw_queue;  // used by limit switch debouncing
 
@@ -83,20 +84,35 @@ void limit_error() {
     mc_critical(ExecAlarm::SoftLimit);
 }
 
+// Soft-limit envelope. `max_travel_mm` is a SIGNED extent: magnitude = travel distance, sign =
+// travel direction from the home/boot position. When the axis has a homing block the direction
+// comes from the cycle (homing->_positiveDirection) and the magnitude is |max_travel|. WITHOUT a
+// homing block (e.g. servos that torque-home at boot, so FluidNC assumes mpos=0 at power-up) the
+// SIGN of max_travel is the only direction indicator: positive => the envelope extends to +travel,
+// negative => to -travel. (The old code ignored the sign without homing and always used [-|t|, 0],
+// which mirrored positive-travel axes — the soft limits then blocked motion into the work area.)
 float limitsMaxPosition(axis_t axis) {
     auto axisConfig = Axes::_axis[axis];
     auto homing     = axisConfig->_homing;
     auto mpos       = homing ? homing->_mpos : 0;
-    auto maxtravel  = axisConfig->_maxTravel;
+    auto travel     = axisConfig->_maxTravel;
 
-    return (!homing || homing->_positiveDirection) ? mpos : mpos + maxtravel;
+    if (homing) {
+        float mag = fabsf(travel);
+        return homing->_positiveDirection ? mpos : mpos + mag;
+    }
+    return travel >= 0.0f ? mpos + travel : mpos;
 }
 
 float limitsMinPosition(axis_t axis) {
     auto axisConfig = Axes::_axis[axis];
     auto homing     = axisConfig->_homing;
     auto mpos       = homing ? homing->_mpos : 0;
-    auto maxtravel  = axisConfig->_maxTravel;
+    auto travel     = axisConfig->_maxTravel;
 
-    return (!homing || homing->_positiveDirection) ? mpos - maxtravel : mpos;
+    if (homing) {
+        float mag = fabsf(travel);
+        return homing->_positiveDirection ? mpos - mag : mpos;
+    }
+    return travel >= 0.0f ? mpos : mpos + travel;
 }

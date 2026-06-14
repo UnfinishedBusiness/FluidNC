@@ -77,7 +77,8 @@ namespace MotorDrivers {
             float motor_pos  = homing ? config->_kinematics->max_motor_pos(_axis) : 0;
             set_steps(_axis, motor_pos_to_steps(motor_pos, _axis));
 
-            float home_time_sec = (axisConfig->_maxTravel / axisConfig->_maxRate * 60 * 1.1);  // 1.1 fudge factor for accell time.
+            float home_time_sec =
+                (fabsf(axisConfig->_maxTravel) / axisConfig->_maxRate * 60 * 1.1);  // 1.1 fudge factor for accell time. (max_travel is signed)
 
             _disabled = false;
             set_location();                                         // force the PWM to update now

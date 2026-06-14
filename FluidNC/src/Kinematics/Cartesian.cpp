@@ -388,7 +388,7 @@ namespace Kinematics {
             switch (phase) {
                 case Machine::Homing::Phase::FastApproach:
                     axis_rate = homing->_seekRate;
-                    travel    = axisConfig->_maxTravel;
+                    travel    = fabsf(axisConfig->_maxTravel);  // magnitude; max_travel is signed
                     break;
                 case Machine::Homing::Phase::PrePulloff:
                 case Machine::Homing::Phase::SlowApproach:
