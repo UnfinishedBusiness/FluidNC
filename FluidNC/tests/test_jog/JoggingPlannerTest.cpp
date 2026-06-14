@@ -19,6 +19,7 @@ extern const EnumItem messageLevels2[];
 #include "System.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -41,22 +42,6 @@ namespace {
         return *reinterpret_cast<Channel*>(0x1);
     }
 
-    // The velocity-setpoint engine RAMPS the emitted feed (first block slow, climbing to the
-    // clamped cruise), so assertions check the ramp's plateau / ceiling rather than a fixed feed.
-    float maxPlannedFeed() {
-        float m = 0.0f;
-        for (auto& l : plannedLines) {
-            m = std::max(m, l.feed);
-        }
-        return m;
-    }
-    float minPlannedFeed() {
-        float m = 1e30f;
-        for (auto& l : plannedLines) {
-            m = std::min(m, l.feed);
-        }
-        return plannedLines.empty() ? 0.0f : m;
-    }
 }
 
 Machine::MachineConfig* config = nullptr;
@@ -159,6 +144,29 @@ void send_alarm(ExecAlarm alarm) {
     set_state(State::Alarm);
 }
 
+// Mock the direct-stepper engine. Vector jogs now drive JogStepper (the integer DDA in the step
+// ISR) instead of the planner, so there are no plannedLines for a vector jog. Track active state
+// and the peak published velocity so tests assert the new contract. enter() mirrors the real one
+// (State::Jog + active); the integer DDA itself is covered by JogIntegratorTest (dda_step).
+float jogVelMaxMmS = 0.0f;
+namespace Machine {
+    volatile bool    JogStepper::_active          = false;
+    volatile int32_t JogStepper::_inc[MAX_N_AXIS] = { 0 };
+    int32_t          JogStepper::_acc[MAX_N_AXIS] = { 0 };
+
+    float JogStepper::maxCruiseMmMin(const float*) { return 1.0e9f; }  // no DDA cap in the host test
+    void  JogStepper::isr_compute(AxisMask&, AxisMask&) {}
+    void  JogStepper::setVelocity(const float v[3]) {
+        float m      = std::max({ std::fabs(v[0]), std::fabs(v[1]), std::fabs(v[2]) });
+        jogVelMaxMmS = std::max(jogVelMaxMmS, m);
+    }
+    void JogStepper::enter() {
+        _active = true;
+        set_state(State::Jog);
+    }
+    void JogStepper::exit() { _active = false; }
+}
+
 namespace {
     class JoggingPlannerTest : public ::testing::Test {
     protected:
@@ -179,6 +187,8 @@ namespace {
             constrainJogCalled = false;
             testMotionEnding   = false;
             flushCount         = 0;
+            jogVelMaxMmS       = 0.0f;
+            Machine::JogStepper::exit();  // ensure not active between tests
             lastAlarm          = ExecAlarm::None;
             testState          = State::Idle;
 
@@ -221,27 +231,18 @@ namespace {
             return jogging.startVector(v, fakeChannel());
         }
 
-        // Start a vector jog and advance it to a genuinely-running state (cycle start processed).
+        // Start a vector jog. startVector's synchronous refill enters direct-stepper mode
+        // (JogStepper mock sets State::Jog + active), so the jog is live on return.
         void establishJog(float feed) {
             setHomingEnabled(true);
-            ASSERT_EQ(startX(feed), Error::Ok);  // queues blocks; state still Idle (start handoff)
-            testState = State::Jog;              // cycle start processed -> Jog
-            jogging.refill();                    // observes Jog: keeps the runway topped up
+            ASSERT_EQ(startX(feed), Error::Ok);
             ASSERT_TRUE(jogging.active());
         }
 
-        // Model the planner draining: advance the executed position toward the commanded edge a
-        // little each tick and refill, so the velocity-setpoint integrator keeps ramping toward the
-        // setpoint over many refills (the firmware sees real execution; the static-mpos harness
-        // would otherwise pin the lead and stop integrating).
-        void simulateExecution(int ticks) {
-            for (int i = 0; i < ticks; ++i) {
-                for (axis_t a = X_AXIS; a < Machine::Axes::_numberAxis; ++a) {
-                    float d    = gc_state.position[a] - testMpos[a];
-                    float step = 0.25f;  // mm of execution per tick
-                    testMpos[a] += (d > step) ? step : (d < -step ? -step : d);
-                }
-                testState = State::Jog;
+        // Pump the ~1 kHz refill tick n times (the integrator ramps velocity toward the setpoint;
+        // the JogStepper mock records the peak published velocity).
+        void pumpRefills(int n) {
+            for (int i = 0; i < n && jogging.active(); ++i) {
                 jogging.refill();
             }
         }
@@ -249,35 +250,31 @@ namespace {
 
     // ---- Runaway acceptance matrix: every termination path must queue NOTHING more ----
 
+    // ---- Runaway acceptance matrix: every termination path must stand the engine down ----
+    // Vector jogs run the direct-stepper engine; "terminated" means active()==false (JogStepper
+    // exited). The DDA step math itself is covered by JogIntegratorTest (dda_step).
+
     TEST_F(JoggingPlannerTest, Cancel0x85MidJogDoesNotResurrect) {
         establishJog(6000.0f);
-        size_t before    = plannedLines.size();
-        testMotionEnding = true;  // 0x85 sets jogCancel while state is still Jog during decel
+        testMotionEnding = true;  // a suspend bit set externally (e.g. a hold) during the jog
         jogging.refill();
-        EXPECT_EQ(plannedLines.size(), before);  // queued nothing more
-        EXPECT_FALSE(jogging.active());          // module terminated
-        // Resurrection check: it stays dead on subsequent ticks.
+        EXPECT_FALSE(jogging.active());  // the safety guard stood the engine down
         jogging.refill();
         jogging.refill();
-        EXPECT_EQ(plannedLines.size(), before);
-        EXPECT_FALSE(jogging.active());
+        EXPECT_FALSE(jogging.active());  // stays dead
     }
 
     TEST_F(JoggingPlannerTest, FeedHoldMidJogTerminates) {
         establishJog(6000.0f);
-        size_t before = plannedLines.size();
-        testState     = State::Hold;
+        testState = State::Hold;
         jogging.refill();
-        EXPECT_EQ(plannedLines.size(), before);
         EXPECT_FALSE(jogging.active());
     }
 
     TEST_F(JoggingPlannerTest, AlarmMidJogTerminates) {
         establishJog(6000.0f);
-        size_t before = plannedLines.size();
-        testState     = State::Alarm;
+        testState = State::Alarm;
         jogging.refill();
-        EXPECT_EQ(plannedLines.size(), before);
         EXPECT_FALSE(jogging.active());
     }
 
@@ -285,12 +282,10 @@ namespace {
         establishJog(6000.0f);
         jogging.onMotionTerminated();  // what protocol_do_rt_reset()'s hook calls
         EXPECT_FALSE(jogging.active());
-        size_t before = plannedLines.size();
-        testState     = State::Idle;  // reset returns to Idle
+        testState = State::Idle;  // reset returns to Idle
         jogging.refill();
         jogging.refill();
-        EXPECT_EQ(plannedLines.size(), before);  // no resurrection
-        EXPECT_FALSE(jogging.active());
+        EXPECT_FALSE(jogging.active());  // no resurrection
     }
 
     TEST_F(JoggingPlannerTest, UnlockAfterAlarmedJogDoesNotResume) {
@@ -298,43 +293,40 @@ namespace {
         testState = State::Alarm;
         jogging.refill();  // alarm terminates the jog
         ASSERT_FALSE(jogging.active());
-        size_t before = plannedLines.size();
-        testState     = State::Idle;  // $X unlock
+        testState = State::Idle;  // $X unlock
         for (int i = 0; i < 5; ++i) {
             jogging.refill();
         }
-        EXPECT_EQ(plannedLines.size(), before);  // the old jog must NOT resume
-        EXPECT_FALSE(jogging.active());
+        EXPECT_FALSE(jogging.active());  // the old jog must NOT resume
     }
 
-    TEST_F(JoggingPlannerTest, QuickTapStopFlushesQueuedRunway) {
+    // A tap: start then stop. The integrator ramps the velocity down to rest and the engine tears
+    // down (JogStepper::exit). No planner queue, no flush — the move is whatever the brief ramp
+    // covered (bounded by press time; the distance bound is asserted in JogIntegratorTest).
+    TEST_F(JoggingPlannerTest, TapRampsDownAndTerminates) {
         setHomingEnabled(true);
-        // Tap race: start queues the runway, but the cycle start has NOT been processed (Idle).
         ASSERT_EQ(startX(12000.0f), Error::Ok);
-        ASSERT_FALSE(plannedLines.empty());  // a runway was queued
         ASSERT_TRUE(jogging.active());
-        // Stop arrives before the state flips to Jog.
-        ASSERT_EQ(jogging.stop(fakeChannel()), Error::Ok);
-        EXPECT_GE(flushCount, 1);            // queued-but-unstarted blocks were flushed
-        EXPECT_TRUE(plannedLines.empty());   // nothing left to execute (~0 distance, not the runway)
-        EXPECT_FALSE(jogging.active());
+        ASSERT_EQ(jogging.stop(fakeChannel()), Error::Ok);  // release -> ramp to rest
+        pumpRefills(5000);                                  // let the velocity ramp to zero
+        EXPECT_FALSE(jogging.active());                     // tore down at rest
+        EXPECT_EQ(flushCount, 0);                           // direct stepping never flushes a planner queue
     }
 
     TEST_F(JoggingPlannerTest, ShuttleSessionThenVectorJogRestoresKind) {
         setHomingEnabled(true);
-        // Shuttle a tiny path, which sets _kind = Shuttle.
+        // Shuttle a tiny path, which sets _kind = Shuttle (planner-fed path).
         ASSERT_EQ(jogging.shuttleBegin(2, fakeChannel()), Error::Ok);
         ASSERT_EQ(jogging.shuttleData("0:0,0;100,0", fakeChannel()), Error::Ok);
         ASSERT_EQ(jogging.shuttleJog(1, 3000.0f, fakeChannel()), Error::Ok);
         ASSERT_EQ(jogging.shuttleEnd(fakeChannel()), Error::Ok);
         testState = State::Idle;
         jogging.refill();
-        plannedLines.clear();
-        // A vector jog must now dispatch to the VECTOR refill (sticky-kind bug would leave it dead).
+        // A vector jog must now dispatch to the direct-stepper engine (sticky-kind bug would leave it dead).
         ASSERT_EQ(startX(6000.0f), Error::Ok);
-        EXPECT_FALSE(plannedLines.empty());
-        EXPECT_NEAR(maxPlannedFeed(), 6000.0f, 1.0f);  // ramp reaches the commanded cruise
-        EXPECT_LE(maxPlannedFeed(), 6000.0f + 1.0f);   // and never exceeds it
+        EXPECT_TRUE(jogging.active());
+        pumpRefills(2000);
+        EXPECT_NEAR(jogVelMaxMmS, 100.0f, 1.0f);  // ramped to the commanded cruise (6000 mm/min)
     }
 
     TEST_F(JoggingPlannerTest, HomingDisabledDoesNotApplyUnhomedFeedCap) {
@@ -343,8 +335,8 @@ namespace {
         jogging._allow_unhomed = true;
 
         ASSERT_EQ(startX(6000.0f), Error::Ok);
-        ASSERT_FALSE(plannedLines.empty());
-        EXPECT_NEAR(maxPlannedFeed(), 6000.0f, 1.0f);  // no cap: ramp reaches the full cruise
+        pumpRefills(2000);
+        EXPECT_NEAR(jogVelMaxMmS, 100.0f, 1.0f);  // no cap: ramps to the full cruise
     }
 
     TEST_F(JoggingPlannerTest, AlarmUnhomedAllowedJogAppliesUnhomedFeedCap) {
@@ -355,10 +347,8 @@ namespace {
         lastAlarm = ExecAlarm::Unhomed;
 
         ASSERT_EQ(startX(6000.0f), Error::Ok);
-        ASSERT_FALSE(plannedLines.empty());
-        EXPECT_LE(maxPlannedFeed(), 1000.0f + 1.0f);   // capped: the ramp never exceeds the unhomed cap
-        EXPECT_NEAR(maxPlannedFeed(), 1000.0f, 1.0f);  // and reaches it
-        EXPECT_TRUE(plannedLines.front().limits_checked);  // no soft-limit envelope while unhomed
+        pumpRefills(2000);
+        EXPECT_NEAR(jogVelMaxMmS, 1000.0f / 60.0f, 1.0f);  // capped to the unhomed feed cap
     }
 
     TEST_F(JoggingPlannerTest, HomedIdleJogDoesNotApplyUnhomedFeedCap) {
@@ -366,44 +356,37 @@ namespace {
         jogging._allow_unhomed = true;
 
         ASSERT_EQ(startX(6000.0f), Error::Ok);
-        ASSERT_FALSE(plannedLines.empty());
-        EXPECT_NEAR(maxPlannedFeed(), 6000.0f, 1.0f);
+        pumpRefills(2000);
+        EXPECT_NEAR(jogVelMaxMmS, 100.0f, 1.0f);
     }
 
-    TEST_F(JoggingPlannerTest, LiveFeedChangeRefillsWithNewFeedForSameVector) {
+    // A live feed change ramps the published velocity toward the new cruise.
+    TEST_F(JoggingPlannerTest, LiveFeedChangeRampsToNewFeed) {
         setHomingEnabled(true);
-
         ASSERT_EQ(startX(6000.0f), Error::Ok);
-        simulateExecution(400);  // ramp up and settle at the commanded cruise
-        EXPECT_NEAR(maxPlannedFeed(), 6000.0f, 1.0f);
+        pumpRefills(2000);
+        EXPECT_NEAR(jogVelMaxMmS, 100.0f, 1.0f);  // at 6000 mm/min
 
-        ASSERT_EQ(jogging.changeFeed(3000.0f, fakeChannel()), Error::Ok);
-        plannedLines.clear();
-        simulateExecution(600);  // integrator ramps DOWN to the new setpoint and holds there
-        ASSERT_FALSE(plannedLines.empty());
-        EXPECT_NEAR(plannedLines.back().feed, 3000.0f, 100.0f);  // settled at the new feed
-        EXPECT_GE(minPlannedFeed(), 3000.0f - 100.0f);            // ramped toward it, never under
+        jogVelMaxMmS = 0.0f;
+        ASSERT_EQ(jogging.changeFeed(12000.0f, fakeChannel()), Error::Ok);
+        pumpRefills(2000);
+        EXPECT_NEAR(jogVelMaxMmS, 200.0f, 1.0f);  // ramped up to the new 12000 mm/min
+        EXPECT_TRUE(jogging.active());
     }
 
-    // Direction change mid-jog must BLEND the velocity vector (no stop/flush): a +X jog re-issued
-    // as +Y emits Y motion while still moving, without a protocol_flush_queued_jog (the old engine
-    // would hard-corner / requeue). The smooth arc is verified at the math layer (JogIntegratorTest).
-    TEST_F(JoggingPlannerTest, DirectionChangeMidJogBlendsWithoutFlush) {
+    // A direction change mid-jog must not tear down or flush — it stays active and blends (the
+    // smooth blended arc is verified at the math layer in JogIntegratorTest).
+    TEST_F(JoggingPlannerTest, DirectionChangeMidJogStaysActiveNoFlush) {
         establishJog(6000.0f);
-        simulateExecution(200);  // settle moving along +X
+        pumpRefills(200);
         int flushBefore = flushCount;
 
         Machine::JogCommand::Vector v;
         v.axis[1]     = 1;  // now +Y (drop X)
         v.feed_mm_min = 6000.0f;
         ASSERT_EQ(jogging.startVector(v, fakeChannel()), Error::Ok);
-        EXPECT_EQ(flushCount, flushBefore) << "a direction change must not flush — it blends";
-
-        size_t before = plannedLines.size();
-        simulateExecution(400);
-        ASSERT_GT(plannedLines.size(), before);
-        // The newest waypoints carry Y motion (the blended vector swung toward +Y).
-        EXPECT_GT(plannedLines.back().target[Y_AXIS], plannedLines.front().target[Y_AXIS]);
+        EXPECT_EQ(flushCount, flushBefore);  // direction change never flushes
+        pumpRefills(400);
         EXPECT_TRUE(jogging.active());
     }
 }

@@ -69,6 +69,23 @@ namespace Machine {
         }
         inline bool moving(const State& s) { return speed(s) > EPS_V_MM_S; }
 
+        // Per-axis integer DDA used by the direct-stepper jog engine (JogStepper). `inc` is the
+        // signed Q16 step increment per ISR tick; `acc` is the persistent Q16 accumulator. Returns
+        // -1 / 0 / +1 step for this tick. Pure integer (ISR-safe) and host-testable here.
+        constexpr int32_t DDA_ONE = 1 << 16;  // fixed-point unit (must match JogStepper::ONE)
+        inline int dda_step(int32_t inc, int32_t& acc) {
+            int32_t mag = inc < 0 ? -inc : inc;
+            if (mag == 0) {
+                return 0;
+            }
+            acc += mag;
+            if (acc >= DDA_ONE) {
+                acc -= DDA_ONE;
+                return inc < 0 ? -1 : 1;
+            }
+            return 0;
+        }
+
         // Seed the trajectory edge at the current machine/commanded position; velocity starts at rest.
         inline void seed(State& s, const float pos[3]) {
             for (int a = 0; a < 3; ++a) {

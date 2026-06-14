@@ -1,0 +1,61 @@
+// Copyright (c) 2026 -  FluidNC contributors
+// Use of this source code is governed by a GPLv3 license that can be found in the LICENSE file.
+
+#pragma once
+
+#include "../Config.h"  // MAX_N_AXIS, AxisMask, axis_t
+#include <cstdint>
+
+// LinuxCNC-style direct-stepper velocity jog (Route B). Drives the steppers DIRECTLY from a
+// per-axis velocity via an integer DDA inside the step ISR, bypassing the GRBL planner entirely
+// (no lookahead, no tail-to-zero — the things that made the planner-fed engine feel wrong).
+//
+// The trajectory (per-axis velocity that ramps toward direction*cruise at the accel limit and
+// blends on a direction change) is produced by Machine::JogIntegrator in the ~1 kHz refill task;
+// each tick that task publishes the per-axis velocity here via setVelocity(). The step ISR
+// (Stepper::pulse_func) calls isr_compute() to advance a per-axis fixed-point accumulator and emit
+// the next step/dir bits — exactly the per-joint stepgen model LinuxCNC uses, so multi-axis jogs
+// integrate independently and blend into smooth arcs.
+//
+// Position truth: the emitted bits are pulsed by Stepping::step(), which advances axis_steps[]
+// (the machine-position source of truth). On exit we resync the planner + gcode parser to that
+// stepped position so following moves are correct.
+namespace Machine {
+    class JogStepper {
+    public:
+        // Fixed step-ISR rate during a jog. Single-step-per-tick, so the max jog rate per axis is
+        // JOG_STEP_HZ / steps_per_mm. The vector refill caps cruise to keep within this (so the
+        // integrator's position can't outrun the steps). Raise if a high-steps/mm machine caps
+        // below the desired jog speed (ISR budget permitting).
+        static constexpr uint32_t JOG_STEP_HZ = 60000;
+
+        static bool active() { return _active; }
+
+        // Highest cruise (mm/min) the DDA can emit along `dirUnit` without owing >1 step/axis/tick
+        // (i.e. without the integrator outrunning the steppers). Caller clamps cruise to this.
+        static float maxCruiseMmMin(const float dirUnit[MAX_N_AXIS]);
+
+        // Begin direct-stepper jogging: clean stepper state, enter State::Jog, run the step timer
+        // at JOG_STEP_HZ. Idempotent if already active.
+        static void enter();
+        // End: stop the timer and resync planner + gcode position to the stepped position. Safe to
+        // call when not active.
+        static void exit();
+
+        // Publish per-axis velocity (mm/s, signed) from the 1 kHz integrator task (XYZ vector jog).
+        // Converts to a fixed-point step increment per ISR tick (atomic 32-bit store per axis).
+        static void setVelocity(const float vel_mm_s[3]);
+
+        // Called from the step ISR after the pulse for the previously-computed bits is emitted.
+        // Advances the per-axis DDA and writes the NEXT step/dir bits to latch for the next tick.
+        // IRAM-safe: integer-only, no float, no config access.
+        static void isr_compute(AxisMask& step_out, AxisMask& dir_out);
+
+    private:
+        static constexpr int32_t ONE = 1 << 16;  // fixed-point unit (Q16)
+
+        static volatile bool    _active;
+        static volatile int32_t _inc[MAX_N_AXIS];  // signed steps per tick, Q16 (sign = travel dir)
+        static int32_t          _acc[MAX_N_AXIS];   // ISR-private fractional-step accumulator (Q16)
+    };
+}

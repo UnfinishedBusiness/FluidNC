@@ -14,6 +14,7 @@
 #include "../Logging.h"  // LogStream, log_*, setprecision
 #include "JogMath.h"
 #include "JogIntegrator.h"
+#include "JogStepper.h"
 #include "JogLifecycle.h"
 #include "Homing.h"
 
@@ -143,15 +144,13 @@ namespace Machine {
                                         << " state=" << state_name());
 
         if (_phase == Phase::Stopping) {
-            // A start during a cancel decel (rapid tap / quick reversal). Don't fight the flush —
-            // queue the restart; refill()'s Stopping finalizer re-arms it once the stop settles.
-            // (Without this the lifecycle guard rightly terminates the premature restart and the
-            // operator's held key is silently dropped.)
-            _pendingVecRestart = true;
-            for (int a = 0; a < 3; ++a) {
-                _pendingVec[a] = _vec[a];
-            }
-            _pendingVecFeed = _cruise_mm_min;
+            // Re-press during a ramp-down (rapid tap / quick reversal): resume directly. The
+            // integrator still carries the current velocity and JogStepper is still active, so
+            // flipping back to Jogging blends from the live velocity toward the new vector — no wait
+            // for a full stop, no re-seed. (This is the LinuxCNC "tap it again and it speeds back
+            // up" feel.)
+            _phase = Phase::Jogging;
+            refill();
             return Error::Ok;
         }
 
@@ -159,15 +158,13 @@ namespace Machine {
             _entryUnhomed = unhomedCarveout;
             if (unhomedCarveout) {
                 // Permit motion from Alarm:Unhomed WITHOUT clearing the unhomed flags (unlike $X,
-                // which calls set_all_axes_homed()). Drop to Idle so cycle-start can run; the jog
-                // end restores Alarm:Unhomed. The unhomed feed cap is the only protection while
-                // unhomed. (Runtime-validated on hardware; see docs/jogging.md.)
+                // which calls set_all_axes_homed()). The jog end restores Alarm:Unhomed; the unhomed
+                // feed cap is the only protection while unhomed. (See docs/jogging.md.)
                 set_state(State::Idle);
             }
-            beginPendingStart();  // arm the Idle->Jog handoff window so the first refill may queue
         }
         _phase = Phase::Jogging;
-        refill();
+        refill();  // first tick seeds the integrator + JogStepper::enter()
         return Error::Ok;
     }
 
@@ -188,25 +185,21 @@ namespace Machine {
         if (_phase != Phase::Jogging) {
             return Error::Ok;
         }
-        // Fix tap-race lurch: guarantee no queued jog motion executes after we return, in EVERY
-        // state. If the motion is live (State::Jog) use the JogCancel decel/flush path; otherwise
-        // (notably Idle during the start handoff) the blocks are queued but not yet running, so
-        // flush them directly — leaving them would lurch the whole queued runway (v^2-scaled).
-        if (JogLifecycle::stop_action(observedState()) == JogLifecycle::StopAction::CancelInflight) {
-            // RELEASE = the real jogCancel: decel IN PLACE at machine accel + flush the queued tail.
-            // Overshoot is exactly v^2/2a — the physical minimum, LinuxCNC-equal — INDEPENDENT of how
-            // much runway is queued. That independence is load-bearing: it lets the runway target
-            // carry generous loop-stall slack (JogMath::LOOP_SLACK_S) for rock-solid velocity hold
-            // without any release-feel penalty. (History: the bench runaway was NOT this path — it
-            // was the synchronous command dispatcher, fixed via AsyncUserCommand registration; the
-            // jogCancel decel machinery was proven good by bench feed-hold. The interim natural-stop
-            // design — cease refilling, land at the runway end — worked but coupled overshoot to the
-            // queue depth, capping the hold margin at the exact moment high feeds need more of it.)
+        if (_kind == Kind::Vector) {
+            // Direct-stepper release: ramp the velocity setpoint to rest at the accel limit (smooth,
+            // overshoot = v^2/2a, the LinuxCNC minimum). No planner, no flush — the DDA simply
+            // decelerates. refillVectorDirect's Stopping finalizer exits + resyncs once at rest.
             _phase = Phase::Stopping;
-            protocol_do_motion_cancel();  // state Jog -> protocol_cancel_jogging(): executeHold decel + flush
+            JogIntegrator::release(_integ);
+            return Error::Ok;
+        }
+        // ----- Shuttle (planner-fed, unchanged): decel via jogCancel or flush the unstarted tail -----
+        if (JogLifecycle::stop_action(observedState()) == JogLifecycle::StopAction::CancelInflight) {
+            _phase = Phase::Stopping;
+            protocol_do_motion_cancel();
         } else {
-            flushQueuedJog();      // drop queued-but-unstarted blocks; a stray cycle-start now hits an empty buffer
-            onMotionTerminated();  // teardown (restores Alarm:Unhomed if this was the unhomed carve-out)
+            flushQueuedJog();
+            onMotionTerminated();
         }
         return Error::Ok;
     }
@@ -221,14 +214,17 @@ namespace Machine {
         if (_phase != Phase::Jogging) {
             return;
         }
-        // Identical to $Jog/Stop's live branch (jogCancel decel-in-place + flush), minus any
-        // pending resume — a panic byte means STOP, not "stop then continue".
+        // A panic byte means STOP, not "stop then continue" — drop any pending resume.
         _pendingDir        = 0;
         _pendingVecRestart = false;
         _shuttleDir        = 0;
         _phase             = Phase::Stopping;
+        if (_kind == Kind::Vector) {
+            JogIntegrator::release(_integ);  // same smooth accel-limited ramp-down as $Jog/Stop
+            return;
+        }
         if (state_is(State::Jog)) {
-            protocol_do_motion_cancel();
+            protocol_do_motion_cancel();  // shuttle (planner-fed)
         }
     }
 
@@ -247,6 +243,7 @@ namespace Machine {
         if (_phase == Phase::Idle) {
             return;  // idempotent — safe to call from multiple termination sites
         }
+        JogStepper::exit();  // direct-stepper jog: stop the step timer + resync position (no-op if inactive)
         _phase             = Phase::Idle;
         _sawJog            = false;
         _pendingStartTicks = 0;
@@ -280,59 +277,46 @@ namespace Machine {
     }
 
     void Jogging::refillImpl() {
+        // Vector jogs run on the direct-stepper engine (Route B): the per-axis velocity integrator
+        // drives an integer DDA in the step ISR, no planner. refillVectorDirect handles both the
+        // held jog (Phase::Jogging) and the ramp-to-rest (Phase::Stopping).
+        if (_kind == Kind::Vector) {
+            if (_phase != Phase::Idle) {
+                refillVectorDirect();
+            }
+            return;
+        }
+
+        // ── Shuttle: planner-fed (unchanged) ────────────────────────────────────────────────────
         if (_phase != Phase::Jogging) {
-            // When the cancel/decel has finished and we are back to Idle, finish up.
+            // Cancel/decel finished and back to Idle: finalize and resume a pending reversal.
             if (_phase == Phase::Stopping && (state_is(State::Idle) || state_is(State::Alarm))) {
                 _phase = Phase::Idle;
-                resetIntegrator();  // the decel finished; a restart below re-seeds the trajectory
-                // Unhomed round-trip: a jog that started from Alarm:Unhomed returns there (NOT Idle)
-                // so program-start homing enforcement and the host's homing badge stay truthful.
                 if (_entryUnhomed && state_is(State::Idle)) {
                     _entryUnhomed = false;
                     send_alarm(ExecAlarm::Unhomed);
                 }
-                // Shuttle reversal/release has settled to rest on the path. Re-seed the commanded
-                // position to where we actually stopped, then resume if a direction is still held.
-                if (_kind == Kind::Shuttle && _shuttleOpen) {
+                if (_shuttleOpen) {
                     _reseedOnRun = true;
                     if (_pendingDir != 0) {
                         _shuttleDir    = _pendingDir;
                         _cruise_mm_min = _pendingFeed;
                         _pendingDir    = 0;
-                        beginPendingStart();  // arm the start handoff for the resumed direction
+                        beginPendingStart();
                         _phase = Phase::Jogging;
-                    }
-                }
-                // Vector restart queued during the decel (rapid tap / reversal): re-arm it now,
-                // but only from a clean Idle (an alarm termination must stay terminated).
-                if (_kind == Kind::Vector && _pendingVecRestart) {
-                    _pendingVecRestart = false;
-                    if (state_is(State::Idle)) {
-                        for (int a = 0; a < 3; ++a) {
-                            _vec[a] = _pendingVec[a];
-                        }
-                        if (computeDirection()) {
-                            _cruise_mm_min = _pendingVecFeed;
-                            beginPendingStart();
-                            _phase = Phase::Jogging;
-                        }
                     }
                 }
             }
             return;
         }
 
-        // Fix A — self-validating refill. Queue ONLY while the machine is genuinely executing our
-        // jog (or during the Idle->Jog handoff of a start we issued). Any other observation means a
-        // motion-termination path (0x85, hold, soft reset, alarm, completion) ended the motion
-        // WITHOUT telling us; stop and tear down instead of re-queueing. This guard alone defeats
-        // the runaway even if no teardown hook is wired.
-        State st = observedState();
+        // Self-validating refill (the runaway guard): queue only while genuinely jogging.
+        State st           = observedState();
         if (st == State::Jog) {
-            _sawJog            = true;  // the cycle actually started
+            _sawJog            = true;
             _pendingStartTicks = 0;
         }
-        bool motionEnding = sys_motion_ending();  // a cancel/hold/door is in progress
+        bool motionEnding = sys_motion_ending();
         bool pendingStart = _pendingStartTicks > 0 && !_sawJog;
         if (JogLifecycle::refill_action(st, motionEnding, _sawJog, pendingStart) == JogLifecycle::RefillAction::Terminate) {
             onMotionTerminated();
@@ -341,47 +325,46 @@ namespace Machine {
         if (pendingStart) {
             --_pendingStartTicks;
         }
-
-        if (_kind == Kind::Shuttle) {
-            refillShuttle();
-        } else {
-            float cruise = effectiveCruise();
-            if (cruise <= 0.0f) {
-                return;
-            }
-            // Cap the cruise to what the planner ring can physically HOLD flat at this accel — a
-            // slightly slower jog that holds velocity beats a faster setpoint the queue can never
-            // sustain (it would saturate below the hold threshold and oscillate like streamed $J=).
-            float accel  = vectorAccel();
-            int   blocks = config->_planner_blocks;
-            cruise       = std::min(cruise, JogIntegrator::max_holdable_feed_mm_min(accel, blocks));
-            // Extents are enforced per-axis on Axis::_softLimits, NOT on homing: a soft-limits-on
-            // machine with homing-not-required (known boot position) gets full envelope protection,
-            // while the Alarm:Unhomed free-jog carve-out (position genuinely unknown) gets none so
-            // the operator can drive toward the switches. The per-axis _softLimits gate is applied
-            // inside refillVector via constrain_jog and the integrator fences.
-            refillVector(cruise, accel, !unhomedJogExceptionActive());
-        }
+        refillShuttle();
     }
 
-    void Jogging::refillVector(float cruise, float accel, bool enforceExtents) {
-        // Seed the trajectory edge at the current commanded position on the first tick of a jog
-        // (and after every teardown, which clears _integ). gc_state.position == mpos at start.
+    void Jogging::refillVectorDirect() {
+        // Safety net: once the jog is live (enter() set State::Jog), any external termination — an
+        // alarm, a suspend/feed-hold, a soft reset, or any state we don't own — drops everything.
+        // During our own ramp-down the state is still Jog with no suspend bit, so this stays passive.
+        if (JogStepper::active() && (sys_motion_ending() || !state_is(State::Jog))) {
+            onMotionTerminated();  // JogStepper::exit() (stop timer + resync) + teardown
+            return;
+        }
+
+        float accel = vectorAccel();
+
+        // First tick of a fresh jog: seed the integrator at the live position and enter direct mode
+        // (sets State::Jog and wakes the step timer at JOG_STEP_HZ).
         if (!_integ.primed) {
             JogIntegrator::seed(_integ, gc_state.position);
+            JogStepper::enter();
         }
-        // Update the velocity setpoint from the current direction + clamped cruise. A direction or
-        // feed change mid-jog just lands here again; the integrator blends toward the new vector.
-        JogIntegrator::set_target(_integ, _dirUnit, cruise);
 
-        // Build the per-axis soft-limit envelope (absolute machine mm). Gate on Axis::_softLimits —
-        // NOT on homing — so soft-limits-on machines get extents whether or not homing is required;
-        // pass no fence for the unhomed free-jog carve-out (enforceExtents=false, position unknown)
-        // and for axes with soft limits off (large sentinel).
+        if (_phase == Phase::Jogging) {
+            float cruise = effectiveCruise();
+            // Cap cruise so the DDA never owes more than one step/axis/tick (keeps the integrator's
+            // position from outrunning the steps it commands).
+            cruise        = std::min(cruise, JogStepper::maxCruiseMmMin(_dirUnit));
+            JogIntegrator::set_target(_integ, _dirUnit, cruise);
+            _lastTargetMm = cruise * JogMath::MM_MIN_TO_MM_S;  // |JogQ target speed (mm/s)
+        } else {
+            JogIntegrator::release(_integ);  // Phase::Stopping — ramp the velocity vector to rest
+            _lastTargetMm = 0.0f;
+        }
+
+        // Per-axis soft-limit fences: gate on Axis::_softLimits, NOT homing, so a soft-limits-on
+        // machine with no homing (known boot position) still gets extents. The only no-fence case
+        // is the Alarm:Unhomed free-jog carve-out (position genuinely unknown — reach the switches).
         float        limMin[3], limMax[3];
         const float* pMin = nullptr;
         const float* pMax = nullptr;
-        if (enforceExtents) {
+        if (!unhomedJogExceptionActive()) {
             for (int a = 0; a < 3; ++a) {
                 auto ax = (a < Axes::_numberAxis) ? config->_axes->_axis[a] : nullptr;
                 if (ax && ax->_softLimits) {
@@ -396,85 +379,14 @@ namespace Machine {
             pMax = limMax;
         }
 
-        // Integrate the trajectory forward and emit waypoints until the queued lead reaches the
-        // committed-lead target (>= braking distance, so the executing feed holds flat) or the
-        // planner ring is full. The integrator carries velocity across ticks, so this races ahead
-        // to (re)fill the lead, then later ticks just top up the few mm execution has drained.
-        int queued = 0;
-        while (_phase == Phase::Jogging && plan_get_block_buffer_available() > 1) {
-            float* mpos       = get_mpos();
-            float  queuedLead = 0.0f;  // distance already queued in the planner ahead of execution
-            for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-                float d = gc_state.position[a] - mpos[a];
-                queuedLead += d * d;
-            }
-            queuedLead    = std::sqrt(queuedLead);
-            float vmag    = JogIntegrator::speed(_integ);
-            float lead    = JogIntegrator::committed_lead_mm(vmag, accel);
-            _lastRunwayMm = queuedLead;  // |JogQ: queued lead ...
-            _lastTargetMm = lead;        // ... , committed-lead target
-            // Paced: enough queued, and we are actually moving (so we don't stall the ramp at rest).
-            if (queuedLead >= lead && JogIntegrator::moving(_integ)) {
-                break;
-            }
-            // If the setpoint is zero and we have coasted to rest, there is nothing left to queue.
-            if (!JogIntegrator::moving(_integ) && cruise <= 0.0f) {
-                break;
-            }
+        JogIntegrator::integrate_tick(_integ, accel, JOG_TICK_S, pMin, pMax);
+        JogStepper::setVelocity(_integ.vel);
+        _lastRunwayMm = JogIntegrator::speed(_integ);  // |JogQ current speed (mm/s)
 
-            JogIntegrator::integrate_tick(_integ, accel, JOG_TICK_S, pMin, pMax);
-            vmag = JogIntegrator::speed(_integ);
-            if (!JogIntegrator::should_emit(_integ, vmag)) {
-                continue;  // keep integrating; not enough accumulated for a useful waypoint yet
-            }
-
-            // Emit a waypoint at the integrated trajectory edge, at the CURRENT ramped speed.
-            float target[MAX_N_AXIS];
-            copyAxes(target, gc_state.position);
-            for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-                target[a] = _integ.pos[a];
-            }
-
-            plan_line_data_t pl;
-            memset(&pl, 0, sizeof(pl));
-            pl.feed_rate             = std::max(1.0f, vmag * JogIntegrator::MM_S_TO_MM_MIN);
-            pl.motion.noFeedOverride = 1;
-            pl.is_jog                = true;
-            pl.line_number           = JOG_LINE;
-
-            if (enforceExtents) {
-                // Belt-and-suspenders: the integrator already clamps to the fence, but re-clamp the
-                // emitted block (the same per-axis _softLimits gate constrain_jog applies).
-                config->_kinematics->constrain_jog(target, &pl, gc_state.position);
-            } else {
-                pl.limits_checked = true;  // no envelope (unhomed free-jog carve-out)
-            }
-
-            float moved2 = 0.0f;
-            for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-                float d = target[a] - gc_state.position[a];
-                moved2 += d * d;
-            }
-            if (moved2 < 1e-10f) {
-                // Parked on a fence (constrain_jog zeroed the move): keep the trajectory edge at the
-                // clamped position so the integrator's own fence math agrees, and stop queueing.
-                for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-                    _integ.pos[a] = gc_state.position[a];
-                }
-                JogIntegrator::note_emitted(_integ, vmag);
-                break;
-            }
-
-            if (!mc_linear(target, &pl, gc_state.position)) {
-                break;  // jog cancelled in-flight
-            }
-            copyAxes(gc_state.position, target);  // advance commanded position (mirrors jog_execute)
-            JogIntegrator::note_emitted(_integ, vmag);
-            ++queued;
-        }
-
-        if (queued) {
-            protocol_auto_cycle_start();  // wake the stepper into the Jog state
+        // Ramp-to-rest complete: back to Idle, exit the stepper, resync planner+gcode position.
+        if (_phase == Phase::Stopping && !JogIntegrator::moving(_integ)) {
+            set_state(State::Idle);  // onMotionTerminated does the Alarm:Unhomed round-trip if needed
+            onMotionTerminated();
         }
     }
 

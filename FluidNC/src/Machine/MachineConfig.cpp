@@ -231,7 +231,13 @@ namespace Machine {
 
             auto filesize = file.size();
             if (filesize <= 0) {
+                // An empty (or truncated/corrupt-to-zero) config must NOT leave the global `config`
+                // null — that null-derefs at the first config->_name access and panics. Fall back to
+                // the built-in defaults, same as the open-failure path below.
                 log_config_error("Configuration file:" << filename << " is empty");
+                log_info("Using default configuration");
+                load_yaml(defaultConfig);
+                set_state(State::ConfigAlarm);
                 return;
             }
 
@@ -240,6 +246,9 @@ namespace Machine {
             auto actual      = file.read(buffer.get(), filesize);
             if (actual != filesize) {
                 log_config_error("Configuration file:" << filename << " read error - expected " << filesize << " got " << actual);
+                log_info("Using default configuration");
+                load_yaml(defaultConfig);
+                set_state(State::ConfigAlarm);
                 return;
             }
             log_info("Configuration file:" << filename);

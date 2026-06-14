@@ -179,6 +179,40 @@ TEST(JogIntegrator, CommittedLeadCoversBrakingDistance) {
     }
 }
 
+TEST(JogIntegrator, DdaEmitsStepsMatchingVelocity) {
+    // The direct-stepper jog DDA: inc (Q16 steps/tick) accumulates; over N ticks the net steps
+    // equal velocity*steps_per_mm*time. 100 mm/s * 100 steps/mm at 60 kHz -> ~10000 steps/s.
+    const int32_t ONE = 1 << 16;
+    auto toInc = [](float vel_mm_s, float spmm, float hz) {
+        float inc = vel_mm_s * spmm * (float(1 << 16) / hz);
+        if (inc > float((1 << 16) - 1)) inc = float((1 << 16) - 1);
+        if (inc < -float((1 << 16) - 1)) inc = -float((1 << 16) - 1);
+        return int32_t(std::lround(inc));
+    };
+    int32_t inc = toInc(100.0f, 100.0f, 60000.0f);
+    int32_t acc = 0;
+    long    net = 0;
+    for (int i = 0; i < 60000; ++i) {
+        net += dda_step(inc, acc);
+    }
+    EXPECT_NEAR(double(net), 10000.0, 2.0);
+    EXPECT_GT(inc, 0);
+    EXPECT_LT(inc, ONE);  // <= 1 step/tick
+
+    // Negative velocity -> negative steps.
+    inc = toInc(-50.0f, 80.0f, 60000.0f);
+    acc = 0;
+    net = 0;
+    for (int i = 0; i < 60000; ++i) {
+        net += dda_step(inc, acc);
+    }
+    EXPECT_NEAR(double(net), -4000.0, 2.0);
+
+    // Zero increment never steps.
+    acc = 0;
+    EXPECT_EQ(dda_step(0, acc), 0);
+}
+
 TEST(JogIntegrator, MaxHoldableFeedIsPositiveAndHoldable) {
     const int blocks = 16;
     for (float a : { 100.0f, 500.0f, 1524.0f }) {

@@ -125,10 +125,10 @@ namespace Machine {
         bool _inRefill = false;
         void refillImpl();
 
-        // Vector refill: integrate the velocity-setpoint trajectory and emit waypoints to keep the
-        // queued lead at the committed-lead target. enforceExtents gates the per-axis soft-limit
-        // envelope (keyed on Axis::_softLimits, NOT on homing — see refillImpl).
-        void refillVector(float cruise, float accel, bool enforceExtents);
+        // Vector jog (Route B): advance the per-axis velocity integrator one tick and publish it to
+        // the direct-stepper DDA (JogStepper). Handles the held jog and the ramp-to-rest; the GRBL
+        // planner is never used. Extents are per-axis on Axis::_softLimits (NOT homing).
+        void refillVectorDirect();
         // Reset the velocity-setpoint trajectory so the next jog re-seeds from the machine position.
         void resetIntegrator() { _integ = JogIntegrator::State {}; }
         void refillShuttle();

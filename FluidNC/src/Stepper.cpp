@@ -15,6 +15,9 @@
 #include "StepperPrivate.h"
 #include "Planner.h"
 #include "Protocol.h"
+#ifdef ENABLE_FW_JOG
+#    include "Machine/JogStepper.h"
+#endif
 #include <cmath>
 
 using namespace Stepper;
@@ -202,6 +205,23 @@ bool IRAM_ATTR Stepper::pulse_func() {
 
     Stepping::step(st.step_outbits, st.dir_outbits);
     st.step_outbits = 0;
+
+#ifdef ENABLE_FW_JOG
+    // Direct-stepper velocity jog (Route B): bypass the planner/segment path entirely. The pulse
+    // for the previously-computed bits was just emitted above; compute the next per-axis DDA bits
+    // to latch, lower the pins (mirroring the unstep() at the normal path's tail), and keep firing
+    // at the jog rate set in JogStepper::enter(). axis_steps[] stays truthful via Stepping::step().
+    if (Machine::JogStepper::active()) {
+        Machine::JogStepper::isr_compute(st.step_outbits, st.dir_outbits);
+        // MUST reprogram the period every tick: the timer auto-reloads at the last-set value, and
+        // this branch bypasses the segment loader that normally sets it (line ~213). Without this
+        // the ISR keeps firing at whatever stale (possibly tiny) period prior motion left, storming
+        // the CPU into an interrupt-WDT panic. fStepperTimer/JOG_STEP_HZ is a compile-time constant.
+        Stepping::setTimerPeriod(Stepping::fStepperTimer / Machine::JogStepper::JOG_STEP_HZ);
+        Stepping::unstep();
+        return true;
+    }
+#endif
 
     // If there is no step segment, attempt to pop one from the stepper buffer
     if (st.exec_segment == NULL) {

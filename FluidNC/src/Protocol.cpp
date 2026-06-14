@@ -12,6 +12,9 @@
 
 #include "Machine/MachineConfig.h"
 #include "Machine/Homing.h"
+#ifdef ENABLE_FW_JOG
+#    include "Machine/JogStepper.h"
+#endif
 #include "Report.h"               // report_feedback_message
 #include "Limit.h"                // limits_get_state, soft_limit
 #include "Planner.h"              // plan_get_current_block
@@ -935,6 +938,13 @@ void protocol_exec_rt_system() {
         case State::SafetyDoor:
         case State::Homing:
         case State::Jog:
+#ifdef ENABLE_FW_JOG
+            // A direct-stepper firmware jog drives the steppers itself (Stepper::pulse_func DDA
+            // branch); the planner is idle and must not be prepped into the segment buffer.
+            if (Machine::JogStepper::active()) {
+                break;
+            }
+#endif
             Stepper::prep_buffer();
             break;
     }

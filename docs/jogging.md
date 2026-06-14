@@ -16,53 +16,49 @@ A sender talks to it over the same line protocol it already uses; the full wire 
 
 ## Why not just stream `$J=`?
 
-`$J=` jogs are discrete blocks. To hold a button down you must keep refilling the planner
-over the serial link, and any latency in that refill lets the planner's **tail-to-zero**
-reach the front of the queue — the machine decelerates mid-jog and the felt velocity sags.
-The firmware engine refills *in process* from the realtime loop with sub-millisecond
-latency, so the queued runway never runs dry and held velocity stays ruler-flat.
+`$J=` jogs are discrete planner blocks. To hold a button down the sender must keep refilling the
+planner over the serial link, and the planner's lookahead/**tail-to-zero** owns the velocity
+profile — so cornering decelerates at every junction and held velocity is inconsistent. Feeding
+the planner *in process* (an earlier "Route A" attempt) does not fix this: the planner is still
+in charge. The firmware engine instead bypasses the planner entirely and drives the steppers at a
+commanded per-axis velocity (below).
 
-The engine does **not** bypass the planner or drive the steppers directly — it feeds the
-**existing planner/stepper path** (compatible with RMT and I2S stepping). This is "Route A":
-a self-refilling planner feed.
+### Route B: direct-stepper velocity jog (LinuxCNC equivalent)
 
-### LinuxCNC-style velocity-setpoint trajectory
+The vector-jog engine **drives the stepper motors directly and does not use the GRBL planner at
+all** — the planner's lookahead and "last queued block exits at zero" rule are exactly what made
+a planner-fed jog feel wrong (cornering chokes, motion is inconsistent). Instead it is a per-joint
+**stepgen**, the same model LinuxCNC uses:
 
-The engine is a **per-axis trapezoidal velocity integrator** (`JogMath` companion
-`JogIntegrator.h`), ported from the proven host-side jog planner. Each refill tick it slews a
-per-axis velocity vector toward `direction × cruise` at the axis acceleration limit, integrates
-position, and emits the integrated path as short jog blocks (waypoints) into the planner. The
-ramp lives **in the engine, in time** — *not* in the planner's lookahead — which is what gives
-the LinuxCNC feel:
+- A per-axis **velocity integrator** (`JogIntegrator.h`, ported from GcodePilot's proven host-side
+  jog planner) runs in the ~1 kHz refill tick: each axis slews its velocity toward
+  `direction × cruise` at the accel limit and integrates independently.
+- Each tick it publishes the per-axis velocity (mm/s) to `JogStepper`, which converts it to a
+  fixed-point step increment and runs an **integer DDA inside the step ISR** (`Stepper::pulse_func`
+  → `JogIntegrator::dda_step`): each axis accumulates and emits a step when it crosses one full
+  step. Pulses go out through the universal `Stepping::step()`, so it works on every stepping
+  engine (RMT, I2S, timed) and `axis_steps[]` — the machine-position source of truth — stays exact.
 
-- **A quick tap makes a small move.** Velocity only ramps for as long as the key is held, so a
-  tap integrates a brief ramp and stops — the move scales with press time, not with any fixed
-  block/runway size. (The old engine committed a full-cruise runway up front, so a tap lurched
-  ~`v²/2a` at full speed.)
-- **Cornering sweeps a smooth arc.** A direction change re-aims the setpoint; the velocity
-  *vector* slews per axis (ramping through zero on a reversal), so the resultant traces a blended
-  arc instead of an angular "S-curve." Waypoints are emitted denser through the turn so the
-  planner's junction-deviation never forces a near-stop.
+This is what delivers the RC-car feel:
 
-### The flat-velocity invariant
+- **A quick tap makes a small move.** Velocity only ramps while the key is held; the steppers
+  only ever move at the integrated velocity, so a tap covers exactly the brief ramp — bounded by
+  press time, with no committed runway to overshoot.
+- **Cornering sweeps a smooth arc.** A direction change re-aims the setpoint; each axis slews its
+  own velocity (ramping through zero on a reversal), so the resultant velocity *vector* rotates
+  smoothly and the path is a blended arc, never an angular "S-curve."
+- **Flat velocity at any speed.** Once an axis reaches cruise the DDA emits steps at a constant
+  rate — there is no queue to starve, so no flutter. Cruise is capped to `JogStepper::JOG_STEP_HZ
+  / steps_per_mm` so the DDA never owes more than one step/axis/tick.
+- **Smooth, minimal stop.** `$Jog/Stop` and realtime `0x85` set the velocity setpoint to zero; the
+  integrator ramps each axis to rest at the accel limit (overshoot `v²/2a`, the physical minimum).
+  A re-press during the ramp-down resumes from the live velocity (tap-and-speed-back-up).
 
-The planner always plans the last queued block to exit at zero velocity. The machine can
-therefore only *hold* feed `v` while at least the braking distance `v²/2a` stays queued ahead of
-the executing point. The engine paces emission to keep the **committed lead** —
-`v²/2a + v·LEAD_MARGIN_S` (`LEAD_MARGIN_S` = 80 ms), clamped to a sane window — queued ahead at
-the *current* speed every tick, so the decel tail is never reached and the executing feed stays
-pinned at cruise. The additive `v·LEAD_MARGIN_S` rides out the worst protocol-loop pass (a
-synchronous status-report TX blocks the loop ~14 ms at 115200; CRC/acks/bursts stack on top); it
-is a margin in *time*, flat at every speed (a constant-distance margin would shrink in time as
-`v` rises — clean holds at low feed, flutter at 100%). `max_holdable_feed_mm_min` clamps the
-commanded cruise to what the planner ring can physically hold flat, so a too-fast setpoint
-becomes a slightly slower jog that *holds* rather than one that oscillates. Validated by
-`JogIntegratorTest` (flat hold, plus the tap/blend/release/extent gates) in `tests/test_jog`.
-
-This margin is **free**: it does not increase release overshoot. `$Jog/Stop` and realtime `0x85`
-decelerate *in place* through the real jog-cancel path — a smooth, acceleration-limited
-deceleration that flushes the queued lead, so overshoot is exactly `v²/2a` (the physical minimum)
-*independent* of how much runway is queued. Hold-robustness and stop-feel stay decoupled.
+When the jog ends, `JogStepper::exit()` resyncs the planner and gcode parser to the stepped
+position (`gc_sync_position(); plan_sync_position();`, the same recipe homing uses) so the next
+program/`$J=` move starts from the true machine position. The integer DDA and the velocity
+trajectory are host-tested in `tests/test_jog` (`JogIntegratorTest`: `dda_step`, plus tap-bound,
+reversal blend, release overshoot, soft-limit park).
 
 ## Configuration
 
@@ -155,48 +151,37 @@ The sender uses this to highlight the live position along the toolpath.
 
 ## Lifecycle & termination (safety)
 
-The engine keeps blocks queued while it believes it is jogging, and tops the queue up from the
-realtime loop. That self-refill is what makes held velocity flat — but it also means the engine
-**must stop refilling the instant the motion is no longer genuinely its own**, or it would
-re-queue blocks (and re-fire cycle start) right after a panic action and resurrect motion. Two
-layers guarantee that:
+A vector jog drives the steppers directly while the engine believes it owns the motion. It
+**must stop the instant the motion is no longer genuinely its own**, or it would keep stepping
+after a panic action. Two layers guarantee that:
 
-**1. Self-validating refill (primary).** Every refill tick the engine validates the live machine
-state and stops — queueing nothing and dropping to idle — unless one of these holds:
+**1. Self-validating tick (primary).** Every ~1 kHz tick the engine checks the live machine state
+and tears down — stopping the step timer and dropping to idle — unless the machine is in `Jog`
+with no cancel/hold/door (suspend) condition active. Any other observation — `Alarm`, `Hold`,
+`Sleep`, `Homing`, a program `Cycle`, `SafetyDoor`, or a suspend bit set — terminates the engine.
 
-- the machine is in `Jog` **and** no cancel/hold/door (suspend) condition is active; or
-- the machine is in `Idle` during the brief, self-initiated `Idle→Jog` start handoff (bounded by
-  a few ticks so a start that never takes — e.g. a jog that immediately parks on a soft limit —
-  expires instead of spinning).
+**2. Belt-and-suspenders teardown (immediate).** `onMotionTerminated()` is also called the moment
+the system terminates motion (soft-reset and alarm handlers, gated to FWJOG builds); it calls
+`JogStepper::exit()` to stop the step timer and resync position immediately rather than at the
+next tick.
 
-Any other observation — `Idle` after the jog ran, `Alarm`, `Hold`, `Sleep`, `Homing`, a program
-`Cycle`, `SafetyDoor`, or a jog-cancel/feed-hold in progress (a suspend bit set while still
-`Jog`) — terminates the engine. This guard alone defeats the runaway even with no other wiring.
-
-**2. Belt-and-suspenders teardown (immediate).** The engine is also told the moment the system
-terminates motion, so it exits on the same tick rather than at the next refill. `onMotionTerminated()`
-is called from three sites (all gated to FWJOG builds): the jog-cancel buffer flush, the soft-reset
-handler, and the alarm handler.
-
-Termination matrix (each verified by a test that asserts **no blocks are queued or executed**
-after the action):
+Termination matrix:
 
 | Action while jogging | Result |
 |----------------------|--------|
-| Realtime jog-cancel `0x85` | decelerate, flush, engine terminates — no re-queue |
-| Feed-hold | engine terminates |
+| Realtime `0x85` / `$Jog/Stop` | velocity ramps to rest at the accel limit (`v²/2a`), engine exits |
+| Feed-hold / suspend | engine terminates (step timer stopped) |
 | Soft reset `0x18` | engine terminates |
 | Alarm (limit, etc.) | engine terminates |
 | `$X` unlock *after* an alarmed jog | does **not** resume the old jog |
-| `$Jog/Stop` "quick tap" (before motion starts) | queued runway is flushed — executed distance ≈ 0, not the full `v²`-scaled runway |
+| Quick tap | only the brief ramp is stepped — bounded by press time, no committed runway |
 
-**Stop guarantees no leftover motion in every state.** `$Jog/Stop` (and `$Shu/End`) decelerate
-through the normal jog-cancel path when motion is live (`Jog`); when a stop arrives during the
-start handoff (`Idle`, cycle start not yet processed) the queued-but-unstarted blocks are flushed
-directly, so a fast tap can never lurch the whole queued runway.
+On exit the engine **resyncs the planner + gcode position** to the stepped position
+(`gc_sync_position(); plan_sync_position();`), so the next program/`$J=` move starts correctly.
 
-**Vector and shuttle modes are mutually exclusive and reset on each start**, so a vector jog
-issued after a shuttle session always runs as a vector jog (and vice-versa).
+**Vector and shuttle modes are mutually exclusive and reset on each start** — a vector jog after a
+shuttle session always runs as a vector jog. (Shuttle `$Shu/*` still uses the planner-fed path; it
+is a path-constrained motion that does not map onto free per-axis velocity.)
 
 ## Capability advertisement
 
@@ -214,20 +199,18 @@ feature-detect from this line and fall back to streamed `$J=` jogs when it is ab
 the sender opens the port after boot, and `$I` is unusable on a `must_home` board parked in
 Alarm:Unhomed — passive detection alone made the jog source nondeterministic across reboots.
 
-## Velocity hold & queue capacity
+## Velocity hold & step rate
 
-The planner ring holds `planner_blocks` (~16) entries; only `(planner_blocks − 2)` of runway can
-ever be queued. The integrator emits speed-scaled waypoints (longer at cruise, capped at
-`SEG_MAX_MM`) and `JogIntegrator::max_holdable_feed_mm_min` clamps the commanded cruise to the
-fastest speed whose committed lead (`v²/2a + v·LEAD_MARGIN_S`) the ring can hold — beyond it the
-queue would saturate below the hold threshold and the feed would sag/oscillate like host-streamed
-`$J=` (the original F15240 bench defect). Live queue health is reported as
-`|JogQ:<queued-lead>,<committed-lead>` in the `?` status while a vector jog runs: queued lead
-pinned at/above the committed-lead target = flat velocity.
+There is no planner queue to starve, so held velocity is flat by construction — once at cruise the
+DDA emits steps at a constant rate. The cap is the step-ISR rate: `JogStepper::JOG_STEP_HZ`
+(default 60 kHz) bounds the max jog rate per axis to `JOG_STEP_HZ / steps_per_mm`, and the
+commanded cruise is clamped to that (`JogStepper::maxCruiseMmMin`) so the DDA never owes more than
+one step/axis/tick. Raise `JOG_STEP_HZ` (ISR budget permitting) if a high-`steps_per_mm` machine
+caps below the desired jog speed. The `?` status reports `|JogQ:<speed>,<target-speed>` (mm/s)
+while a vector jog runs.
 
-A `$Jog/Start` arriving during a cancel decel (rapid tap, quick reversal) is queued as a pending
-restart and re-armed from the Stopping finalizer at clean Idle — never dropped, never fighting
-the flush.
+A re-press during the ramp-down resumes directly from the live velocity (no wait for a full stop),
+so rapid taps and quick reversals feel continuous.
 
 ## Build
 
