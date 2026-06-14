@@ -313,22 +313,6 @@ namespace {
         EXPECT_EQ(flushCount, 0);                           // direct stepping never flushes a planner queue
     }
 
-    TEST_F(JoggingPlannerTest, ShuttleSessionThenVectorJogRestoresKind) {
-        setHomingEnabled(true);
-        // Shuttle a tiny path, which sets _kind = Shuttle (planner-fed path).
-        ASSERT_EQ(jogging.shuttleBegin(2, fakeChannel()), Error::Ok);
-        ASSERT_EQ(jogging.shuttleData("0:0,0;100,0", fakeChannel()), Error::Ok);
-        ASSERT_EQ(jogging.shuttleJog(1, 3000.0f, fakeChannel()), Error::Ok);
-        ASSERT_EQ(jogging.shuttleEnd(fakeChannel()), Error::Ok);
-        testState = State::Idle;
-        jogging.refill();
-        // A vector jog must now dispatch to the direct-stepper engine (sticky-kind bug would leave it dead).
-        ASSERT_EQ(startX(6000.0f), Error::Ok);
-        EXPECT_TRUE(jogging.active());
-        pumpRefills(2000);
-        EXPECT_NEAR(jogVelMaxMmS, 100.0f, 1.0f);  // ramped to the commanded cruise (6000 mm/min)
-    }
-
     TEST_F(JoggingPlannerTest, HomingDisabledDoesNotApplyUnhomedFeedCap) {
         setHomingEnabled(false);
         forceAxesUnhomed();

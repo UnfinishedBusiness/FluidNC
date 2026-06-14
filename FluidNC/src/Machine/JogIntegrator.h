@@ -22,7 +22,7 @@
 //     (the committed-lead pacing below maintains that).
 //
 // Header-only and dependency-free (only <algorithm>/<cmath>) so it is shared by the firmware module
-// AND unit-tested on the x86 host, exactly like JogMath.h / JogLifecycle.h.
+// AND unit-tested on the x86 host, exactly like JogMath.h.
 namespace Machine {
     namespace JogIntegrator {
 

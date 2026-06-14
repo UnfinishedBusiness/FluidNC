@@ -22,7 +22,7 @@ TEST(JogCapabilities, ReportsExactContractLine) {
     CapturingChannel out;
     Machine::reportFwJogCapabilities(out);
     EXPECT_EQ(out.level, MsgLevelNone);
-    EXPECT_EQ(out.line, "[CAP:FWJOG=1,FWSHU=1]");
+    EXPECT_EQ(out.line, "[CAP:FWJOG=1]");
 }
 
 TEST(JogVector, ParsesFullVector) {
@@ -63,52 +63,4 @@ TEST(JogFeed, ParsesAndRejects) {
     EXPECT_FALSE(parse_feed("-1", f));
     EXPECT_FALSE(parse_feed("12x", f));
     EXPECT_FALSE(parse_feed("", f));
-}
-
-TEST(Shuttle, ParsesDirectionAndFeed) {
-    int8_t d = 9;
-    float  f = 0;
-    ASSERT_TRUE(parse_shuttle("1 F3000", d, f));
-    EXPECT_EQ(d, 1);
-    EXPECT_FLOAT_EQ(f, 3000.0f);
-
-    ASSERT_TRUE(parse_shuttle("-1 F800", d, f));
-    EXPECT_EQ(d, -1);
-
-    ASSERT_TRUE(parse_shuttle("0", d, f));  // release needs no feed
-    EXPECT_EQ(d, 0);
-    EXPECT_FLOAT_EQ(f, 0.0f);
-}
-
-TEST(Shuttle, RejectsBad) {
-    int8_t d;
-    float  f;
-    EXPECT_FALSE(parse_shuttle("1", d, f));      // held dir needs feed
-    EXPECT_FALSE(parse_shuttle("2 F100", d, f)); // dir not -1/0/1
-    EXPECT_FALSE(parse_shuttle("1 X100", d, f)); // missing F
-    EXPECT_FALSE(parse_shuttle("1 F0", d, f));   // non-positive feed
-    EXPECT_FALSE(parse_shuttle("", d, f));
-}
-
-TEST(ShuttleData, ParsesVerticesAtAbsoluteIndex) {
-    ShuttleVertex v[8];
-    int           first = -1;
-    int           n     = parse_shuttle_data("12:1.5,2.0;3.25,-4.5;0,0", first, v, 8);
-    ASSERT_EQ(n, 3);
-    EXPECT_EQ(first, 12);
-    EXPECT_FLOAT_EQ(v[0].x, 1.5f);
-    EXPECT_FLOAT_EQ(v[0].y, 2.0f);
-    EXPECT_FLOAT_EQ(v[1].x, 3.25f);
-    EXPECT_FLOAT_EQ(v[1].y, -4.5f);
-    EXPECT_FLOAT_EQ(v[2].x, 0.0f);
-}
-
-TEST(ShuttleData, RejectsMalformedAndOverflow) {
-    ShuttleVertex v[2];
-    int           first;
-    EXPECT_EQ(parse_shuttle_data("5 1,2", first, v, 2), -1);     // missing colon
-    EXPECT_EQ(parse_shuttle_data("5:1", first, v, 2), -1);       // missing y
-    EXPECT_EQ(parse_shuttle_data("5:1,2;3,x", first, v, 2), -1); // bad number
-    EXPECT_EQ(parse_shuttle_data("5:1,2;3,4;5,6", first, v, 2), -1); // overflow maxN=2
-    EXPECT_EQ(parse_shuttle_data(":1,2", first, v, 2), -1);      // missing index
 }

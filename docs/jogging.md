@@ -1,9 +1,11 @@
-# Firmware-native jogging & shuttle
+# Firmware-native jogging
 
-A built-in motion engine that lets a sender drive **continuous, smoothly-held jogs** and a
-**path shuttle** (jog the tool back and forth *along the loaded toolpath*) without streaming
-a string of `$J=` blocks. The sender sends one start command; the firmware keeps the motion
-fed until told to stop.
+A built-in motion engine that lets a sender drive **continuous, smoothly-held jogs** without
+streaming a string of `$J=` blocks. The sender sends one start command; the firmware drives the
+steppers directly until told to stop.
+
+(Path shuttle — jogging along the loaded toolpath — was removed from the firmware; senders now do
+that host-side with `$J=`.)
 
 It is **optional and gated at build time.** It is compiled in only when
 `-DENABLE_FW_JOG` is set — that flag is on for the `noradio` / `noradio_s3` targets and off
@@ -108,47 +110,6 @@ parks while the others keep moving — the jog slides along the fence. The **sol
 case is the `allow_unhomed` `Alarm:Unhomed` carve-out, where the position is genuinely unknown
 and you must be able to jog toward the homing switches; there the feed cap is the only guard.
 
-## Path shuttle (`$Shu/*`)
-
-Shuttle mode jogs the tool **along the program's XY toolpath** — useful for inspecting or
-re-running a section. The sender streams the path as a sliding window of vertices; the
-firmware never holds the whole program. It walks a commanded position along that polyline by
-arc length, forward or backward.
-
-| Command | Meaning |
-|---------|---------|
-| `$Shu/Begin=<N>` | Open a session for a path of `N` total vertices. |
-| `$Shu/Data=<firstIdx>:x,y;x,y;…` | Load consecutive vertices (mm) at absolute index `firstIdx`. Chunks of ≤64; must be contiguous with the loaded window. |
-| `$Shu/Jog=<±1\|0> F<mm/min>` | Hold a direction along the path (`+1` forward / `−1` back) at cruise `F`; `0` releases. |
-| `$Shu/End` | Close the session and free the window. |
-
-- The vertex window is a 1024-entry ring keyed by absolute index, so the sender can stream
-  ahead and let old vertices fall out behind the tool.
-- **Entry** requires the machine to already be on the loaded path (within 1 mm) — the sender
-  positions it there first; otherwise `error:9`.
-- **Release** (`$Shu/Jog=0`) lets the planner decelerate to rest *on the path*. A
-  **direction reversal** stops first, then resumes the other way from where it actually came
-  to rest (the planner forces the stop at the reversal point; you cannot reverse with
-  infinite jerk).
-- **Window/path edges:** if the tool reaches the end of the loaded window (runway not yet
-  streamed) or the end of the path, it decelerates and parks there; streaming more `Data`
-  resumes motion.
-- Per-block axis limits are enforced by the planner; the unhomed feed cap still applies.
-
-### Shuttle status field
-
-While a session is open, the realtime status report (`?` and the `$Report/Interval`
-auto-report) carries:
-
-```
-|Shu:<vidx>,<s_mm>
-```
-
-- **`vidx`** — absolute index of the path vertex at or behind the tool's current position.
-- **`s_mm`** — arc length (mm, 3 dp) from that vertex to the tool.
-
-The sender uses this to highlight the live position along the toolpath.
-
 ## Lifecycle & termination (safety)
 
 A vector jog drives the steppers directly while the engine believes it owns the motion. It
@@ -179,21 +140,17 @@ Termination matrix:
 On exit the engine **resyncs the planner + gcode position** to the stepped position
 (`gc_sync_position(); plan_sync_position();`), so the next program/`$J=` move starts correctly.
 
-**Vector and shuttle modes are mutually exclusive and reset on each start** — a vector jog after a
-shuttle session always runs as a vector jog. (Shuttle `$Shu/*` still uses the planner-fed path; it
-is a path-constrained motion that does not map onto free per-axis velocity.)
-
 ## Capability advertisement
 
 When the engine is compiled in, the firmware advertises it on the **boot banner** and in
 the `$I` build-info response:
 
 ```
-[CAP:FWJOG=1,FWSHU=1]
+[CAP:FWJOG=1]
 ```
 
-`FWJOG` = the `$Jog/*` vector engine; `FWSHU` = the `$Shu/*` shuttle engine. A sender should
-feature-detect from this line and fall back to streamed `$J=` jogs when it is absent.
+`FWJOG` = the `$Jog/*` vector engine. A sender should feature-detect from this line and fall back
+to streamed `$J=` jogs when it is absent.
 
 **`$Cap` (anyState)** emits the same line on demand. Use it: the boot banner is missed whenever
 the sender opens the port after boot, and `$I` is unusable on a `must_home` board parked in

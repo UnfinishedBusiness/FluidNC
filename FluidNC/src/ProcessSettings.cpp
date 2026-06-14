@@ -1029,37 +1029,6 @@ static Error fwJogStop(const char* value, AuthenticationLevel, Channel& out) {
     }
     return config->_jogging->stop(out);
 }
-static Error fwShuBegin(const char* value, AuthenticationLevel, Channel& out) {
-    if (!config->_jogging || !value) {
-        return Error::InvalidStatement;
-    }
-    char* end   = nullptr;
-    long  total = strtol(value, &end, 10);
-    if (end == value) {
-        return Error::InvalidStatement;  // error:3
-    }
-    return config->_jogging->shuttleBegin(static_cast<int>(total), out);
-}
-static Error fwShuData(const char* value, AuthenticationLevel, Channel& out) {
-    if (!config->_jogging || !value) {
-        return Error::InvalidStatement;
-    }
-    return config->_jogging->shuttleData(value, out);
-}
-static Error fwShuJog(const char* value, AuthenticationLevel, Channel& out) {
-    int8_t dir;
-    float  feed = 0.0f;
-    if (!config->_jogging || !value || !Machine::JogCommand::parse_shuttle(value, dir, feed)) {
-        return Error::InvalidStatement;  // error:3
-    }
-    return config->_jogging->shuttleJog(dir, feed, out);
-}
-static Error fwShuEnd(const char* value, AuthenticationLevel, Channel& out) {
-    if (!config->_jogging) {
-        return Error::InvalidStatement;
-    }
-    return config->_jogging->shuttleEnd(out);
-}
 static Error fwCapReport(const char* value, AuthenticationLevel, Channel& out) {
     // On-demand capability line. The boot banner is missed when the sender opens the port after
     // boot, and $I is Idle-gated host-side (a must_home board sits in Alarm:Unhomed) — so a sender
@@ -1151,17 +1120,12 @@ void make_user_commands() {
 #ifdef ENABLE_FW_JOG
     // ASYNC IS LOAD-BEARING — every one of these MUST be AsyncUserCommand. A plain UserCommand is
     // synchronous: the dispatcher calls protocol_buffer_synchronize() ("wait for motion to finish")
-    // after the handler. $Jog/Start begins motion that the refill engine keeps fed, so the planner
-    // never empties and the protocol loop parks in the synchronize FOREVER — line channel dead both
-    // directions while motion runs out of the envelope (the 2026-06-13 bench runaway; root cause of
-    // every "nothing stops it" session). Stock $J is AsyncUserCommand for exactly this reason.
+    // after the handler. $Jog/Start begins a held jog, so the protocol loop would park in the
+    // synchronize FOREVER (line channel dead both directions). Stock $J is AsyncUserCommand for the
+    // same reason.
     new AsyncUserCommand("JGS", "Jog/Start", fwJogStart, anyState);
     new AsyncUserCommand("JGF", "Jog/Feed", fwJogFeed, anyState);
     new AsyncUserCommand("JGX", "Jog/Stop", fwJogStop, anyState);
-    new AsyncUserCommand("SHB", "Shu/Begin", fwShuBegin, anyState);
-    new AsyncUserCommand("SHD", "Shu/Data", fwShuData, anyState);
-    new AsyncUserCommand("SHJ", "Shu/Jog", fwShuJog, anyState);
-    new AsyncUserCommand("SHE", "Shu/End", fwShuEnd, anyState);
     new AsyncUserCommand("CAP", "Cap", fwCapReport, anyState);
 #endif
     new AsyncUserCommand("G", "GCode/Modes", report_gcode, anyState);

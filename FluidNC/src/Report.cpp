@@ -188,7 +188,7 @@ void report_init_message(Channel& channel) {
     // When msg goes out of scope, the destructor will send the line
 
 #ifdef ENABLE_FW_JOG
-    // Advertise the firmware-native jog/shuttle engines on the boot banner too, so a sender can
+    // Advertise the firmware-native vector-jog engine on the boot banner too, so a sender can
     // feature-detect without issuing $I.
     Machine::reportFwJogCapabilities(channel);
 #endif
@@ -412,8 +412,8 @@ void report_build_info(const char* line, Channel& channel) {
     }
 
 #ifdef ENABLE_FW_JOG
-    // Firmware-native jogging/shuttle capability advertisement (see plans/firmware-jogging).
-    // Lets a sender feature-detect the $Jog/* and $Shu/* engines instead of probing.
+    // Firmware-native vector-jog capability advertisement. Lets a sender feature-detect the
+    // $Jog/* engine instead of probing.
     Machine::reportFwJogCapabilities(channel);
 #endif
 }
@@ -617,7 +617,7 @@ void report_realtime_status(Channel& channel) {
     }
 
 #ifdef ENABLE_FW_JOG
-    // Firmware shuttle: |Shu:<vidx>,<s_mm> while a path-window session is open.
+    // Firmware vector jog: |JogQ:<speed>,<target> while a jog runs.
     if (config->_jogging) {
         config->_jogging->status_report(msg);
     }

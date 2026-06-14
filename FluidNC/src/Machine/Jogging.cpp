@@ -4,9 +4,7 @@
 #include "Jogging.h"
 
 #include "MachineConfig.h"   // config, Axes, Kinematics
-#include "../MotionControl.h"  // mc_linear
-#include "../Planner.h"        // plan_get_block_buffer_available, plan_line_data_t
-#include "../Protocol.h"       // protocol_auto_cycle_start, protocol_do_motion_cancel, lastAlarm
+#include "../Protocol.h"       // lastAlarm
 #include "../GCode.h"          // gc_state
 #include "../System.h"         // get_mpos, state_is, sys_motion_ending
 #include "../Limit.h"          // limitsMinPosition, limitsMaxPosition
@@ -15,7 +13,6 @@
 #include "JogMath.h"
 #include "JogIntegrator.h"
 #include "JogStepper.h"
-#include "JogLifecycle.h"
 #include "Homing.h"
 
 #include <cstring>
@@ -23,31 +20,10 @@
 
 namespace Machine {
 
-    // Sentinel line number on synthesized jog blocks (kept out of the program line space).
-    static constexpr int32_t JOG_LINE = -1;
-
-    // Virtual-time step the velocity-setpoint integrator advances per sub-iteration. The refill loop
+    // Virtual-time step the velocity-setpoint integrator advances per refill tick. The refill loop
     // runs at ~1 kHz (vTaskDelay(1)); 1 ms is finer than GcodePilot's 2 ms host substep, so a single
-    // integration per sub-iteration is accurate without sub-stepping.
+    // integration per tick is accurate without sub-stepping.
     static constexpr float JOG_TICK_S = 0.001f;
-
-    // Refill ticks to tolerate State::Idle after issuing a cycle start before the state flips to
-    // Jog. The handoff is normally 1 tick; this bounds a start that never takes (e.g. a jog that
-    // immediately parks on a soft limit) so the module terminates instead of spinning forever.
-    static constexpr int PENDING_START_TICKS = 8;
-
-    // Observe the machine state through the same state_is() seam the rest of the module uses. The
-    // lifecycle decision only distinguishes Jog / Idle / "anything else", so non-Jog/non-Idle
-    // states collapse to a single representative (Alarm) that maps to Terminate.
-    static State observedState() {
-        if (state_is(State::Jog)) {
-            return State::Jog;
-        }
-        if (state_is(State::Idle)) {
-            return State::Idle;
-        }
-        return State::Alarm;
-    }
 
     void Jogging::group(Configuration::HandlerBase& handler) {
         handler.item("allow_unhomed", _allow_unhomed);
@@ -139,7 +115,6 @@ namespace Machine {
             return Error::InvalidStatement;  // error:3
         }
         _cruise_mm_min = v.feed_mm_min;
-        _kind          = Kind::Vector;  // fix sticky-kind: a vector jog after a shuttle session must dispatch to refillVector
         log_info("JogStart received: X" << int(_vec[0]) << " Y" << int(_vec[1]) << " Z" << int(_vec[2]) << " F" << v.feed_mm_min
                                         << " state=" << state_name());
 
@@ -185,58 +160,25 @@ namespace Machine {
         if (_phase != Phase::Jogging) {
             return Error::Ok;
         }
-        if (_kind == Kind::Vector) {
-            // Direct-stepper release: ramp the velocity setpoint to rest at the accel limit (smooth,
-            // overshoot = v^2/2a, the LinuxCNC minimum). No planner, no flush — the DDA simply
-            // decelerates. refillVectorDirect's Stopping finalizer exits + resyncs once at rest.
-            _phase = Phase::Stopping;
-            JogIntegrator::release(_integ);
-            return Error::Ok;
-        }
-        // ----- Shuttle (planner-fed, unchanged): decel via jogCancel or flush the unstarted tail -----
-        if (JogLifecycle::stop_action(observedState()) == JogLifecycle::StopAction::CancelInflight) {
-            _phase = Phase::Stopping;
-            protocol_do_motion_cancel();
-        } else {
-            flushQueuedJog();
-            onMotionTerminated();
-        }
+        // Release: ramp the velocity setpoint to rest at the accel limit (smooth, overshoot =
+        // v^2/2a, the LinuxCNC minimum). The DDA simply decelerates; refillVectorDirect's Stopping
+        // finalizer exits + resyncs position once at rest.
+        _phase = Phase::Stopping;
+        JogIntegrator::release(_integ);
         return Error::Ok;
     }
 
     void Jogging::reset() {
-        onMotionTerminated();  // phase/lifecycle teardown
-        _shuttleOpen = false;  // reset() additionally tears the shuttle session down
-        _path.clear();
+        onMotionTerminated();  // phase teardown (stops the step timer + resyncs position)
     }
 
     void Jogging::stopFromRealtime() {
         if (_phase != Phase::Jogging) {
             return;
         }
-        // A panic byte means STOP, not "stop then continue" — drop any pending resume.
-        _pendingDir        = 0;
-        _pendingVecRestart = false;
-        _shuttleDir        = 0;
-        _phase             = Phase::Stopping;
-        if (_kind == Kind::Vector) {
-            JogIntegrator::release(_integ);  // same smooth accel-limited ramp-down as $Jog/Stop
-            return;
-        }
-        if (state_is(State::Jog)) {
-            protocol_do_motion_cancel();  // shuttle (planner-fed)
-        }
-    }
-
-    void Jogging::beginPendingStart() {
-        _sawJog            = false;
-        _pendingStartTicks = PENDING_START_TICKS;
-    }
-
-    void Jogging::flushQueuedJog() {
-        // Drop blocks that are queued but not yet executing (the JogCancel flush sequence). Safe
-        // here because the steppers have not been woken (state is not Jog).
-        protocol_flush_queued_jog();
+        // 0x85 panic stop: same smooth accel-limited ramp-down as $Jog/Stop.
+        _phase = Phase::Stopping;
+        JogIntegrator::release(_integ);
     }
 
     void Jogging::onMotionTerminated() {
@@ -244,16 +186,8 @@ namespace Machine {
             return;  // idempotent — safe to call from multiple termination sites
         }
         JogStepper::exit();  // direct-stepper jog: stop the step timer + resync position (no-op if inactive)
-        _phase             = Phase::Idle;
-        _sawJog            = false;
-        _pendingStartTicks = 0;
-        _shuttleDir        = 0;
-        _pendingDir        = 0;      // a hard termination cancels any pending shuttle reversal/resume
-        _pendingVecRestart = false;  // ... and any vector restart queued during a decel
-        resetIntegrator();           // next vector jog re-seeds the trajectory from the machine position
-        if (_shuttleOpen) {
-            _reseedOnRun = true;  // re-project the commanded position on the next shuttle jog
-        }
+        _phase = Phase::Idle;
+        resetIntegrator();   // next vector jog re-seeds the trajectory from the machine position
         // Unhomed round-trip: restore Alarm:Unhomed only if the terminating path left us at Idle
         // (an external alarm has already set its own alarm state and must not be overwritten).
         if (_entryUnhomed) {
@@ -265,9 +199,8 @@ namespace Machine {
     }
 
     void Jogging::refill() {
-        // Re-entrancy guard: mc_linear -> mc_move_motors calls protocol_execute_realtime, which calls
-        // refill() again — every queued block recursed one level deeper (stack-hungry at high feeds,
-        // double-queueing per tick). The outer pass does all the work; nested passes are no-ops.
+        // Re-entrancy guard: enter()'s Stepper::reset/wake_up and other realtime hooks can re-enter
+        // protocol_execute_realtime -> refill(). The outer pass does the work; nested passes no-op.
         if (_inRefill) {
             return;
         }
@@ -277,55 +210,12 @@ namespace Machine {
     }
 
     void Jogging::refillImpl() {
-        // Vector jogs run on the direct-stepper engine (Route B): the per-axis velocity integrator
-        // drives an integer DDA in the step ISR, no planner. refillVectorDirect handles both the
-        // held jog (Phase::Jogging) and the ramp-to-rest (Phase::Stopping).
-        if (_kind == Kind::Vector) {
-            if (_phase != Phase::Idle) {
-                refillVectorDirect();
-            }
-            return;
+        // The vector jog runs on the direct-stepper engine: the per-axis velocity integrator drives
+        // an integer DDA in the step ISR, no planner. refillVectorDirect handles both the held jog
+        // (Phase::Jogging) and the ramp-to-rest (Phase::Stopping).
+        if (_phase != Phase::Idle) {
+            refillVectorDirect();
         }
-
-        // ── Shuttle: planner-fed (unchanged) ────────────────────────────────────────────────────
-        if (_phase != Phase::Jogging) {
-            // Cancel/decel finished and back to Idle: finalize and resume a pending reversal.
-            if (_phase == Phase::Stopping && (state_is(State::Idle) || state_is(State::Alarm))) {
-                _phase = Phase::Idle;
-                if (_entryUnhomed && state_is(State::Idle)) {
-                    _entryUnhomed = false;
-                    send_alarm(ExecAlarm::Unhomed);
-                }
-                if (_shuttleOpen) {
-                    _reseedOnRun = true;
-                    if (_pendingDir != 0) {
-                        _shuttleDir    = _pendingDir;
-                        _cruise_mm_min = _pendingFeed;
-                        _pendingDir    = 0;
-                        beginPendingStart();
-                        _phase = Phase::Jogging;
-                    }
-                }
-            }
-            return;
-        }
-
-        // Self-validating refill (the runaway guard): queue only while genuinely jogging.
-        State st           = observedState();
-        if (st == State::Jog) {
-            _sawJog            = true;
-            _pendingStartTicks = 0;
-        }
-        bool motionEnding = sys_motion_ending();
-        bool pendingStart = _pendingStartTicks > 0 && !_sawJog;
-        if (JogLifecycle::refill_action(st, motionEnding, _sawJog, pendingStart) == JogLifecycle::RefillAction::Terminate) {
-            onMotionTerminated();
-            return;
-        }
-        if (pendingStart) {
-            --_pendingStartTicks;
-        }
-        refillShuttle();
     }
 
     void Jogging::refillVectorDirect() {
@@ -390,190 +280,11 @@ namespace Machine {
         }
     }
 
-    float Jogging::shuttleAccel() const {
-        // Limiting acceleration over the XY axes (the shuttle plane), mm/s^2.
-        float accel = 0.0f;
-        auto  axes  = config->_axes;
-        for (int a = 0; a < 2 && a < Axes::_numberAxis; ++a) {
-            if (axes->_axis[a]) {
-                float ax = axes->_axis[a]->_acceleration;
-                accel    = (accel == 0.0f) ? ax : std::min(accel, ax);
-            }
-        }
-        return accel > 0.0f ? accel : 100.0f;
-    }
-
-    void Jogging::refillShuttle() {
-        if (_shuttleDir == 0) {
-            return;  // released: let the planner tail-to-zero coast to a stop on the path
-        }
-
-        // Re-seed the commanded path position to where the machine actually is, after a stop.
-        if (_reseedOnRun) {
-            float* mpos = get_mpos();
-            _cmdPos     = _path.project(mpos[0], mpos[1]);
-            copyAxes(gc_state.position, mpos);  // resync commanded to actual
-            _reseedOnRun = false;
-        }
-
-        float cruise = _cruise_mm_min;
-        if (unhomedFeedCapActive()) {
-            cruise = std::min(cruise, float(_unhomed_feed_cap_mm_min));
-        }
-        if (cruise <= 0.0f) {
-            return;
-        }
-        float accel        = shuttleAccel();
-        float blockLen     = JogMath::block_len_mm(cruise);
-        float targetRunway = JogMath::target_runway_mm(cruise, accel);
-
-        int queued = 0;
-        while (_phase == Phase::Jogging && plan_get_block_buffer_available() > 1) {
-            // Runway = straight-line distance from machine to the commanded path point. Over the
-            // few queued mm the path is nearly straight, so this tracks queued arc length.
-            float* mpos = get_mpos();
-            float  cx, cy;
-            _path.xy(_cmdPos, cx, cy);
-            float dx     = cx - mpos[0];
-            float dy     = cy - mpos[1];
-            float runway = std::sqrt(dx * dx + dy * dy);
-            if (runway >= targetRunway) {
-                break;
-            }
-
-            bool             atEdge;
-            ShuttlePath::Pos next = _path.advance(_cmdPos, blockLen, _shuttleDir, atEdge);
-            if (next.seg == _cmdPos.seg && next.frac == _cmdPos.frac) {
-                break;  // window edge / path end: no progress, planner tail-to-zero parks us here
-            }
-
-            float target[MAX_N_AXIS];
-            copyAxes(target, gc_state.position);
-            _path.xy(next, target[0], target[1]);  // shuttle moves in XY; Z held
-
-            plan_line_data_t pl;
-            memset(&pl, 0, sizeof(pl));
-            pl.feed_rate             = cruise;
-            pl.motion.noFeedOverride = 1;
-            pl.is_jog                = true;
-            pl.line_number           = JOG_LINE;
-            pl.limits_checked        = true;  // path vertices are inside the program envelope
-
-            if (!mc_linear(target, &pl, gc_state.position)) {
-                break;  // cancelled in-flight
-            }
-            copyAxes(gc_state.position, target);
-            _cmdPos = next;
-            ++queued;
-        }
-
-        if (queued) {
-            protocol_auto_cycle_start();
-        }
-    }
-
-    Error Jogging::shuttleBegin(int total, Channel& out) {
-        if (!(state_is(State::Idle) || (_shuttleOpen && state_is(State::Jog)))) {
-            return Error::SystemGcLock;  // error:9
-        }
-        if (total < 2 || total > 1000000) {
-            return Error::InvalidStatement;  // error:3
-        }
-        _path.begin(total);
-        _cmdPos      = ShuttlePath::Pos {};
-        _shuttleOpen = true;
-        _shuttleDir  = 0;
-        _pendingDir  = 0;
-        _reseedOnRun = true;  // seed from the machine position on the first jog
-        _kind        = Kind::Shuttle;
-        return Error::Ok;
-    }
-
-    Error Jogging::shuttleData(const char* body, Channel& out) {
-        if (!_shuttleOpen) {
-            return Error::SystemGcLock;  // error:9, no session
-        }
-        JogCommand::ShuttleVertex verts[64];
-        int                       first = 0;
-        int                       n     = JogCommand::parse_shuttle_data(body, first, verts, 64);
-        if (n < 0) {
-            return Error::InvalidStatement;  // error:3
-        }
-        if (!_path.put(first, verts, n)) {
-            return Error::InvalidStatement;  // out-of-window / gap
-        }
-        return Error::Ok;
-    }
-
-    Error Jogging::shuttleJog(int8_t dir, float feed_mm_min, Channel& out) {
-        if (!_shuttleOpen) {
-            return Error::SystemGcLock;  // error:9
-        }
-        if (!(state_is(State::Idle) || state_is(State::Jog))) {
-            return Error::SystemGcLock;
-        }
-
-        // Entry validation: the machine must be ON the loaded path (host pre-positions it).
-        if (dir != 0 && _shuttleDir == 0 && !_path.empty()) {
-            float* mpos = get_mpos();
-            float  d2   = 0.0f;
-            _path.project(mpos[0], mpos[1], &d2);
-            if (d2 > 1.0f) {  // > 1 mm off the path
-                return Error::SystemGcLock;  // error:9, not on path
-            }
-        }
-
-        if (dir == 0) {
-            // Release: decel to rest on the path (no reversal pending).
-            _shuttleDir  = 0;
-            _pendingDir  = 0;
-            return stop(out);
-        }
-
-        if (_shuttleDir != 0 && dir != _shuttleDir) {
-            // Reversal: stop first, then resume the other way once at rest (handled in refill()).
-            _pendingDir  = dir;
-            _pendingFeed = feed_mm_min;
-            _shuttleDir  = 0;
-            return stop(out);
-        }
-
-        // Same direction (or starting from rest): hold and refill.
-        _shuttleDir    = dir;
-        _cruise_mm_min = feed_mm_min;
-        _kind          = Kind::Shuttle;
-        if (_phase != Phase::Jogging) {
-            beginPendingStart();  // arm the Idle->Jog handoff when starting from rest
-        }
-        _phase = Phase::Jogging;
-        refill();
-        return Error::Ok;
-    }
-
-    Error Jogging::shuttleEnd(Channel& out) {
-        if (_phase == Phase::Jogging) {
-            stop(out);  // Jog -> JogCancel decel; otherwise flush queued blocks (same tap-race guarantee)
-        }
-        _shuttleOpen = false;
-        _shuttleDir  = 0;
-        _pendingDir  = 0;
-        _path.clear();
-        return Error::Ok;
-    }
-
     void Jogging::status_report(LogStream& msg) {
-        // Live queue health while vector-jogging: |JogQ:<runway_mm>,<target_mm>. Bench-diagnosable
-        // velocity hold — runway pinned at/above target == flat feed; runway sagging below braking
-        // distance == the planner is decelerating (capacity/cadence problem to investigate).
-        if (_phase == Phase::Jogging && _kind == Kind::Vector) {
+        // Live jog status while a vector jog runs: |JogQ:<speed_mm/s>,<target_speed_mm/s>.
+        if (_phase == Phase::Jogging) {
             msg << "|JogQ:" << setprecision(1) << _lastRunwayMm << "," << _lastTargetMm;
         }
-        if (!_shuttleOpen || _path.empty()) {
-            return;
-        }
-        float*           mpos = get_mpos();
-        ShuttlePath::Pos here = _path.project(mpos[0], mpos[1]);
-        msg << "|Shu:" << here.seg << "," << setprecision(3) << _path.arcFromVertex(here);
     }
 
 }
