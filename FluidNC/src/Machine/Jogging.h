@@ -24,7 +24,6 @@ namespace Machine {
 
         // config (jogging: section)
         bool    _allow_unhomed            = false;
-        int32_t _unhomed_feed_cap_mm_min  = 1000;
 
         void init();
         void group(Configuration::HandlerBase& handler) override;
@@ -80,9 +79,7 @@ namespace Machine {
         bool canStartUnhomedJog() const;
         // True while the active vector jog is the Alarm:Unhomed carve-out.
         bool unhomedJogExceptionActive() const;
-        // True when the unhomed jog feed cap must be applied.
-        bool unhomedFeedCapActive() const;
-        // Per-axis-clamped cruise (mm/min) for the current vector, incl. the unhomed cap when active.
+        // Per-axis-clamped cruise (mm/min) for the current vector.
         float effectiveCruise() const;
         // Limiting acceleration (mm/s^2) across the active axes of the current vector.
         float vectorAccel() const;

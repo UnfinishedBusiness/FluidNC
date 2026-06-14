@@ -27,12 +27,10 @@ namespace Machine {
 
     void Jogging::group(Configuration::HandlerBase& handler) {
         handler.item("allow_unhomed", _allow_unhomed);
-        handler.item("unhomed_feed_cap_mm_min", _unhomed_feed_cap_mm_min, 0, 1000000);
     }
 
     void Jogging::init() {
-        log_info("Firmware jogging: allow_unhomed=" << _allow_unhomed << " unhomed_cap=" << _unhomed_feed_cap_mm_min
-                                                    << "mm/min");
+        log_info("Firmware jogging: allow_unhomed=" << _allow_unhomed);
     }
 
     bool Jogging::anyAxisUnhomed() const {
@@ -50,10 +48,6 @@ namespace Machine {
 
     bool Jogging::unhomedJogExceptionActive() const {
         return _entryUnhomed && _allow_unhomed && homingRequired() && anyAxisUnhomed();
-    }
-
-    bool Jogging::unhomedFeedCapActive() const {
-        return unhomedJogExceptionActive() && _unhomed_feed_cap_mm_min > 0;
     }
 
     bool Jogging::computeDirection() {
@@ -85,8 +79,7 @@ namespace Machine {
     }
 
     float Jogging::effectiveCruise() const {
-        // Clamp the requested cruise so no active axis exceeds its max_rate along the vector,
-        // then apply the unhomed feed cap only for the Alarm:Unhomed jog carve-out.
+        // Clamp the requested cruise so no active axis exceeds its max_rate along the vector.
         float maxRate[3] = { 0, 0, 0 };
         auto  axes       = config->_axes;
         for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
@@ -94,11 +87,7 @@ namespace Machine {
                 maxRate[a] = axes->_axis[a]->_maxRate;
             }
         }
-        float cruise = JogMath::clamp_feed_to_axis_rates(_cruise_mm_min, _dirUnit, maxRate);
-        if (unhomedFeedCapActive()) {
-            cruise = std::min(cruise, float(_unhomed_feed_cap_mm_min));
-        }
-        return cruise;
+        return JogMath::clamp_feed_to_axis_rates(_cruise_mm_min, _dirUnit, maxRate);
     }
 
     Error Jogging::startVector(const JogCommand::Vector& v, Channel& out) {
@@ -133,8 +122,8 @@ namespace Machine {
             _entryUnhomed = unhomedCarveout;
             if (unhomedCarveout) {
                 // Permit motion from Alarm:Unhomed WITHOUT clearing the unhomed flags (unlike $X,
-                // which calls set_all_axes_homed()). The jog end restores Alarm:Unhomed; the unhomed
-                // feed cap is the only protection while unhomed. (See docs/jogging.md.)
+                // which calls set_all_axes_homed()). The jog end restores Alarm:Unhomed. There is
+                // no soft-limit envelope while unhomed (position is unknown). (See docs/jogging.md.)
                 set_state(State::Idle);
             }
         }

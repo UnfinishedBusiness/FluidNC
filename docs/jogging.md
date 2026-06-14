@@ -69,16 +69,13 @@ A `jogging:` section is optional; defaults are safe.
 ```yaml
 jogging:
   allow_unhomed: false           # permit jogging from Alarm:Unhomed (default false)
-  unhomed_feed_cap_mm_min: 1000  # feed ceiling for the allowed Alarm:Unhomed jog exception
 ```
 
 - **`allow_unhomed`** — when true, a vector jog may start from `Alarm:Unhomed`. The machine
   drops to `Idle` to run the move **without clearing the unhomed flags** (unlike `$X`), and
   re-asserts `Alarm:Unhomed` when the jog ends, so program-start homing enforcement and the
-  sender's homing badge stay truthful. No soft-limit envelope is applied while unhomed, so
-  the feed cap is the only protection — keep it conservative.
-- **`unhomed_feed_cap_mm_min`** — the feed ceiling applied only to the allowed
-  `Alarm:Unhomed` jog exception on machines with required homing enabled.
+  sender's homing badge stay truthful. The jog runs at the full requested feed with **no
+  soft-limit envelope** (the position is unknown) — the operator opts in and owns the risk.
 
 ## Vector jog (`$Jog/*`)
 
@@ -96,8 +93,7 @@ Allowed states: `Idle`, `Jog` (re-issue `Start` to change direction mid-jog), or
 vector/feed returns `error:3`.
 
 The cruise feed is clamped so no active axis exceeds its `max_rate` along the vector
-(`feed ≤ min(max_rate[a]/|dir[a]|)`), then the unhomed cap (if applicable) and the
-queue-holdable cap are applied.
+(`feed ≤ min(max_rate[a]/|dir[a]|)`), then the queue-holdable cap is applied.
 
 ### Machine extents
 
@@ -108,7 +104,7 @@ soft-limit boundary** (`v²/2a` vs. distance-to-fence), so a jog into a limit st
 the fence instead of slamming or overrunning. On a diagonal, the axis that reaches its limit
 parks while the others keep moving — the jog slides along the fence. The **sole** no-envelope
 case is the `allow_unhomed` `Alarm:Unhomed` carve-out, where the position is genuinely unknown
-and you must be able to jog toward the homing switches; there the feed cap is the only guard.
+and you must be able to jog toward the homing switches; there is no envelope guard while unhomed.
 
 ## Lifecycle & termination (safety)
 

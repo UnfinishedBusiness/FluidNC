@@ -210,7 +210,6 @@ namespace {
 
             start._mustHome                      = true;
             jogging._allow_unhomed               = false;
-            jogging._unhomed_feed_cap_mm_min     = 1000;
             Machine::Homing::set_all_axes_homed();
         }
 
@@ -313,7 +312,7 @@ namespace {
         EXPECT_EQ(flushCount, 0);                           // direct stepping never flushes a planner queue
     }
 
-    TEST_F(JoggingPlannerTest, HomingDisabledDoesNotApplyUnhomedFeedCap) {
+    TEST_F(JoggingPlannerTest, HomingDisabledUnhomedJogRunsAtFullFeed) {
         setHomingEnabled(false);
         forceAxesUnhomed();
         jogging._allow_unhomed = true;
@@ -323,7 +322,7 @@ namespace {
         EXPECT_NEAR(jogVelMaxMmS, 100.0f, 1.0f);  // no cap: ramps to the full cruise
     }
 
-    TEST_F(JoggingPlannerTest, AlarmUnhomedAllowedJogAppliesUnhomedFeedCap) {
+    TEST_F(JoggingPlannerTest, AlarmUnhomedAllowedJogRunsAtFullFeed) {
         setHomingEnabled(true);
         forceAxesUnhomed();
         jogging._allow_unhomed = true;
@@ -332,7 +331,7 @@ namespace {
 
         ASSERT_EQ(startX(6000.0f), Error::Ok);
         pumpRefills(2000);
-        EXPECT_NEAR(jogVelMaxMmS, 1000.0f / 60.0f, 1.0f);  // capped to the unhomed feed cap
+        EXPECT_NEAR(jogVelMaxMmS, 100.0f, 1.0f);  // no cap: ramps to the full cruise (6000 mm/min)
     }
 
     TEST_F(JoggingPlannerTest, HomedIdleJogDoesNotApplyUnhomedFeedCap) {
