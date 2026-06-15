@@ -104,8 +104,12 @@ namespace Machine {
             return Error::InvalidStatement;  // error:3
         }
         _cruise_mm_min = v.feed_mm_min;
-        log_info("JogStart received: X" << int(_vec[0]) << " Y" << int(_vec[1]) << " Z" << int(_vec[2]) << " F" << v.feed_mm_min
-                                        << " state=" << state_name());
+        // log_debug, NOT log_info: a joystick/shuttle sender issues many $Jog/Start per second (one per
+        // direction micro-change). At log_info this floods the (CRC-framed) console output on top of the
+        // acks + status reports, congesting the 115200 link until acks lag seconds behind — which a host
+        // watchdog then mistakes for a dead controller and resets. Keep it for forensics behind $Log/Msg.
+        log_debug("JogStart received: X" << int(_vec[0]) << " Y" << int(_vec[1]) << " Z" << int(_vec[2]) << " F" << v.feed_mm_min
+                                         << " state=" << state_name());
 
         if (_phase == Phase::Stopping) {
             // Re-press during a ramp-down (rapid tap / quick reversal): resume directly. The
@@ -145,7 +149,9 @@ namespace Machine {
         // RX-proof diagnostic (bench runaway forensics): if this line appears, the command channel
         // delivered the stop; if motion continues anyway the defect is downstream. If it NEVER
         // appears while the host logged a $Jog/Stop TX, the link/channel is eating lines mid-Jog.
-        log_info("JogStop received: phase=" << static_cast<int>(_phase) << " state=" << state_name());
+        // log_debug, NOT log_info: paired with the per-$Jog/Start log, this fires on every jog command;
+        // at log_info a fast joystick/shuttle stream floods the console and backs the link up (see startVector).
+        log_debug("JogStop received: phase=" << static_cast<int>(_phase) << " state=" << state_name());
         if (_phase != Phase::Jogging) {
             return Error::Ok;
         }
