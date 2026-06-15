@@ -177,6 +177,21 @@ namespace Machine {
         JogStepper::exit();  // direct-stepper jog: stop the step timer + resync position (no-op if inactive)
         _phase = Phase::Idle;
         resetIntegrator();   // next vector jog re-seeds the trajectory from the machine position
+
+        // The direct-stepper integrator bypasses the planner/suspend system entirely, so its teardown
+        // must hand back a clean slate or a subsequent classic $J= planner jog wedges: a lingering
+        // sys.step_control flag makes prep_buffer() bail (segment buffer never fills), and a lingering
+        // motionCancel/jogCancel suspend bit makes protocol_do_initiate_cycle refuse to start the
+        // queued block (machine sits Idle until a reset). JogStepper::enter() already clears these for
+        // the *next firmware* jog; clear them here so the next *classic* jog starts clean too.
+        sys.step_control = {};
+        {
+            auto s         = sys.suspend();
+            s.bit.motionCancel = false;
+            s.bit.jogCancel    = false;
+            sys.set_suspend(s);
+        }
+
         // Unhomed round-trip: restore Alarm:Unhomed only if the terminating path left us at Idle
         // (an external alarm has already set its own alarm state and must not be overwritten).
         if (_entryUnhomed) {

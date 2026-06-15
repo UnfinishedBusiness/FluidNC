@@ -144,6 +144,12 @@ void send_alarm(ExecAlarm alarm) {
     set_state(State::Alarm);
 }
 
+// The real planner/suspend system global. Jogging::onMotionTerminated() now hands it back clean
+// (clears step_control + the jog-blocking suspend bits) so a subsequent classic $J= jog isn't wedged
+// by stale state left from a firmware vector jog. System.cpp isn't in the test src filter, so define
+// the global here (system_t is fully inline in System.h).
+system_t sys;
+
 // Mock the direct-stepper engine. Vector jogs now drive JogStepper (the integer DDA in the step
 // ISR) instead of the planner, so there are no plannedLines for a vector jog. Track active state
 // and the peak published velocity so tests assert the new contract. enter() mirrors the real one
@@ -191,6 +197,7 @@ namespace {
             Machine::JogStepper::exit();  // ensure not active between tests
             lastAlarm          = ExecAlarm::None;
             testState          = State::Idle;
+            sys.reset();   // clean planner/suspend globals between tests
 
             config              = &machine;
             machine._axes       = &axes;
@@ -310,6 +317,31 @@ namespace {
         pumpRefills(5000);                                  // let the velocity ramp to zero
         EXPECT_FALSE(jogging.active());                     // tore down at rest
         EXPECT_EQ(flushCount, 0);                           // direct stepping never flushes a planner queue
+    }
+
+    // Regression (FIX_CLASSIC_JOG_HANG): the firmware-jog teardown must hand the planner/suspend
+    // system back clean, or the next classic $J= planner jog wedges — a stale step_control flag makes
+    // prep_buffer() bail, and a stale motionCancel/jogCancel suspend bit makes initiate_cycle refuse
+    // the queued block (machine sits Idle until a reset). onMotionTerminated() clears both.
+    TEST_F(JoggingPlannerTest, TeardownHandsBackCleanPlannerStateForNextClassicJog) {
+        establishJog(6000.0f);   // firmware jog live (phase != Idle)
+
+        // Simulate the stale globals a firmware jog could leave behind.
+        sys.step_control.endMotion = true;
+        {
+            auto s             = sys.suspend();
+            s.bit.motionCancel = true;
+            s.bit.jogCancel    = true;
+            sys.set_suspend(s);
+        }
+
+        jogging.onMotionTerminated();   // the centralized teardown every reset/alarm path calls
+
+        EXPECT_FALSE(jogging.active());
+        EXPECT_FALSE(sys.step_control.endMotion);        // step_control fully cleared
+        EXPECT_FALSE(sys.step_control.executeHold);
+        EXPECT_FALSE(sys.suspend().bit.motionCancel);    // jog-blocking suspend bits cleared
+        EXPECT_FALSE(sys.suspend().bit.jogCancel);
     }
 
     TEST_F(JoggingPlannerTest, HomingDisabledUnhomedJogRunsAtFullFeed) {
