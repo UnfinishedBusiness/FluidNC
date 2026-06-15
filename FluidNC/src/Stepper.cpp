@@ -219,7 +219,14 @@ bool IRAM_ATTR Stepper::pulse_func() {
         // the CPU into an interrupt-WDT panic. fStepperTimer/JOG_STEP_HZ is a compile-time constant.
         Stepping::setTimerPeriod(Stepping::fStepperTimer / Machine::JogStepper::JOG_STEP_HZ);
         Stepping::unstep();
-        return true;
+        // Re-arm ONLY while the machine is actually jogging. JogStepper::_active is cleared by the
+        // main-loop refill() (via onMotionTerminated) — but if the machine leaves Jog while _active is
+        // still set (an external alarm/idle, or a stale flag after a $J=↔$Jog/Start engine handoff),
+        // returning true unconditionally re-arms the timer at JOG_STEP_HZ forever. That ~50 kHz storm
+        // starves the very task that would clear _active → self-sustaining, and it strangles the comms
+        // task (total RX/status silence — the bench "lost jogging"). Stopping the timer here breaks the
+        // loop: the main loop regains CPU and refill() tears the jog down cleanly on its next tick.
+        return state_is(State::Jog);
     }
 #endif
 
