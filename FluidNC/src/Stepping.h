@@ -77,6 +77,11 @@ namespace Machine {
         static void step(AxisMask step_mask, AxisMask dir_mask);
         static void unstep();
 
+        // Drop the cached direction-bit state so the next step() re-asserts every dir pin. Call after
+        // anything writes the dir pins out-of-band (THC's thcStep, on disable) so a stale cache can't
+        // make step() skip the write and send an axis the wrong way.
+        static void dirInvalidate();
+
         // THC: directly pulse one axis's motor pin(s) via raw GPIO, bypassing the
         // step-segment engine, and track the executed position in axis_steps so the
         // DRO/mpos stays exact.  This lets the Torch Height Control move Z while the

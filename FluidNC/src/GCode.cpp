@@ -1832,6 +1832,11 @@ Error gc_execute_line(const char* input_line) {
                 // The THC service runs at 1 kHz and the step ticker at 8 kHz; give both
                 // time to see _enabled=false and quiesce before re-syncing position.
                 delay_ms(2);
+                // THC drove the Z dir pin out-of-band (thcStep), so step()'s cached direction state is
+                // now stale. Force the next planned move (e.g. G53 G0 Z0 in torch_off) to re-assert every
+                // dir pin — otherwise that move can inherit THC's last Z direction and retract the WRONG
+                // way (down into the work). Planner is drained + THC quiesced here, so the store is safe.
+                Stepping::dirInvalidate();
                 // pl.position only tracks G-code commanded steps — THC-injected corrections
                 // are invisible to it.  Re-sync from axis_steps so the next planned move
                 // (e.g. G53 G0 Z0 in torch_off) starts from the physically correct position

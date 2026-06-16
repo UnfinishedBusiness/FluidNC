@@ -28,6 +28,13 @@ namespace Machine {
 
     AxisMask Stepping::direction_mask = 0;
 
+    // Cache of the last direction bits written to the dir pins, so step() can skip redundant writes.
+    // File-scope (was a function-local static in step()) so the THC disable handoff and reset() can
+    // invalidate it: thcStep() drives the Z dir pin out-of-band and would otherwise leave this stale,
+    // making step() skip the dir write on the next planned move → Z goes the wrong way (see dirInvalidate).
+    // 65535 is the "unknown" sentinel that forces step() to re-assert every dir pin.
+    static AxisMask s_prevDirMask = 65535;
+
     bool    Stepping::_switchedStepper = false;
     int32_t Stepping::_segments        = 12;
 
@@ -130,17 +137,18 @@ void Stepping::unlimit(axis_t axis, motor_t motor) {
 
 void IRAM_ATTR Stepping::step(AxisMask step_mask, AxisMask dir_mask) {
     // Set the direction pins, but optimize for the common
-    // situation where the direction bits haven't changed.
-    static AxisMask previous_dir_mask = 65535;  // should never be this value
-    if (previous_dir_mask == 65535) {
-        // Set all the direction bits the first time
-        previous_dir_mask = ~dir_mask;
+    // situation where the direction bits haven't changed.  s_prevDirMask is file-scope so the THC
+    // disable handoff / reset() can invalidate it (dirInvalidate) — otherwise thcStep()'s out-of-band
+    // dir-pin writes leave it stale and this optimization skips the next move's dir write.
+    if (s_prevDirMask == 65535) {
+        // Set all the direction bits the first time (or after an invalidate)
+        s_prevDirMask = ~dir_mask;
     }
 
-    if (dir_mask != previous_dir_mask) {
+    if (dir_mask != s_prevDirMask) {
         for (axis_t axis = X_AXIS; axis < Axes::_numberAxis; axis++) {
             bool dir     = bitnum_is_true(dir_mask, axis);
-            bool old_dir = bitnum_is_true(previous_dir_mask, axis);
+            bool old_dir = bitnum_is_true(s_prevDirMask, axis);
             if (dir != old_dir) {
                 for (size_t motor = 0; motor < MAX_MOTORS_PER_AXIS; motor++) {
                     auto m = axis_motors[axis][motor];
@@ -152,7 +160,7 @@ void IRAM_ATTR Stepping::step(AxisMask step_mask, AxisMask dir_mask) {
             // Some stepper drivers need time between changing direction and doing a pulse.
             step_engine->finish_dir();
         }
-        previous_dir_mask = dir_mask;
+        s_prevDirMask = dir_mask;
     }
 
     step_engine->start_step();
@@ -230,7 +238,15 @@ void Stepping::thcStep(axis_t axis, bool positive) {
     axis_steps[axis] += positive ? 1 : -1;
 }
 
-void Stepping::reset() {}
+// Force step() to re-write every direction pin on its next call. Required after anything drives the
+// dir pins out-of-band (THC's thcStep) so the cached s_prevDirMask can't make step() skip the write
+// and leave a pin in a stale direction. A single aligned store — safe to call from the protocol task.
+void Stepping::dirInvalidate() {
+    s_prevDirMask = 65535;
+}
+void Stepping::reset() {
+    dirInvalidate();  // a stepper reset (jog/homing/soft-reset) must re-assert dir pins, not trust the cache
+}
 void Stepping::beginLowLatency() {}
 void Stepping::endLowLatency() {}
 
