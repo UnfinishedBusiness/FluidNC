@@ -214,18 +214,23 @@ bool IRAM_ATTR Stepper::pulse_func() {
     if (Machine::JogStepper::active()) {
         Machine::JogStepper::isr_compute(st.step_outbits, st.dir_outbits);
         // MUST reprogram the period every tick: the timer auto-reloads at the last-set value, and
-        // this branch bypasses the segment loader that normally sets it (line ~213). Without this
-        // the ISR keeps firing at whatever stale (possibly tiny) period prior motion left, storming
-        // the CPU into an interrupt-WDT panic. fStepperTimer/JOG_STEP_HZ is a compile-time constant.
-        Stepping::setTimerPeriod(Stepping::fStepperTimer / Machine::JogStepper::JOG_STEP_HZ);
+        // this branch bypasses the segment loader that normally sets it (line ~240). Use the VARIABLE
+        // period published by JogStepper::setVelocity (which tracks the live step rate) — NOT a fixed
+        // fStepperTimer/JOG_STEP_HZ. The fixed 60 kHz pinned the ISR even at zero velocity (a tap whose
+        // $Jog/Stop lands during the ramp, or any stall): a no-op 60 kHz storm that preempted the main
+        // loop running BOTH refill() and serial RX, self-sustainingly wedging the machine in <Jog> with
+        // total RX/status silence until the backlog drained. With the variable period the rate collapses
+        // toward JOG_MIN_STEP_HZ (~1 kHz) at v=0, the main loop regains CPU, and refill() ramps the
+        // velocity back up (or processes the stop) — the period then shortens again as it actually steps.
+        Stepping::setTimerPeriod(Machine::JogStepper::isrPeriod());
         Stepping::unstep();
         // Re-arm ONLY while the machine is actually jogging. JogStepper::_active is cleared by the
         // main-loop refill() (via onMotionTerminated) — but if the machine leaves Jog while _active is
         // still set (an external alarm/idle, or a stale flag after a $J=↔$Jog/Start engine handoff),
-        // returning true unconditionally re-arms the timer at JOG_STEP_HZ forever. That ~50 kHz storm
-        // starves the very task that would clear _active → self-sustaining, and it strangles the comms
-        // task (total RX/status silence — the bench "lost jogging"). Stopping the timer here breaks the
-        // loop: the main loop regains CPU and refill() tears the jog down cleanly on its next tick.
+        // returning true unconditionally re-arms the timer forever. That storm starves the very task
+        // that would clear _active → self-sustaining, and it strangles the comms task (total RX/status
+        // silence — the bench "lost jogging"). Stopping the timer here breaks the loop: the main loop
+        // regains CPU and refill() tears the jog down cleanly on its next tick. (Preserves d47af2fb.)
         return state_is(State::Jog);
     }
 #endif

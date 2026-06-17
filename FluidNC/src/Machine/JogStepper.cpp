@@ -15,10 +15,13 @@
 
 namespace Machine {
 
-    volatile bool    JogStepper::_active           = false;
-    volatile int32_t JogStepper::_inc[MAX_N_AXIS]  = { 0 };
-    int32_t          JogStepper::_acc[MAX_N_AXIS]  = { 0 };
-    volatile float   JogStepper::_rateMmMin        = 0.0f;
+    volatile bool     JogStepper::_active          = false;
+    volatile int32_t  JogStepper::_inc[MAX_N_AXIS] = { 0 };
+    int32_t           JogStepper::_acc[MAX_N_AXIS] = { 0 };
+    volatile float    JogStepper::_rateMmMin       = 0.0f;
+    // Start at the floor period so the very first ISR tick (which fires before refill's first
+    // setVelocity publishes a real rate) idles at JOG_MIN_STEP_HZ rather than storming.
+    volatile uint32_t JogStepper::_isrPeriod       = Stepping::fStepperTimer / JOG_MIN_STEP_HZ;
 
     float JogStepper::maxCruiseMmMin(const float dirUnit[MAX_N_AXIS]) {
         // The fastest axis (|dir|*steps_per_mm largest) must stay <= JOG_STEP_HZ steps/s. Solve for
@@ -44,19 +47,46 @@ namespace Machine {
         _rateMmMin = std::sqrt(v2) * 60.0f;
 
         auto axes = config->_axes;
+
+        // Per-axis signed step rate (steps/s), and the magnitude of the fastest-stepping axis.
+        float rate[MAX_N_AXIS] = { 0.0f };
+        float fastest          = 0.0f;
         for (int a = 0; a < MAX_N_AXIS; ++a) {
-            float v   = (a < 3) ? vel_mm_s[a] : 0.0f;  // vector jog is XYZ only; higher axes never step
-            float inc = 0.0f;
+            float v = (a < 3) ? vel_mm_s[a] : 0.0f;  // vector jog is XYZ only; higher axes never step
             if (v != 0.0f && a < Axes::_numberAxis && axes && axes->_axis[a]) {
-                float spmm = axes->_axis[a]->_stepsPerMm;
-                // steps per ISR tick (Q16) = vel[mm/s] * steps/mm / JOG_STEP_HZ * ONE
-                inc = v * spmm * (float(ONE) / float(JOG_STEP_HZ));
+                rate[a] = v * axes->_axis[a]->_stepsPerMm;
+                fastest = std::max(fastest, std::fabs(rate[a]));
             }
-            // Clamp below one step/tick as a safety floor (cruise is already capped to maxCruise).
-            if (inc > float(ONE - 1)) {
-                inc = float(ONE - 1);
-            } else if (inc < -float(ONE - 1)) {
-                inc = -float(ONE - 1);
+        }
+
+        // The ISR tick rate TRACKS the fastest axis's step rate: that axis then emits ~one step per
+        // tick (max DDA resolution) and — the whole point of this engine's storm fix — at zero/low
+        // velocity the rate collapses toward JOG_MIN_STEP_HZ instead of pinning JOG_STEP_HZ, so the
+        // step ISR stops preempting the main loop (refill() + serial RX). Floor keeps it responsive
+        // to the next velocity update; ceiling guards rounding (cruise is already capped by
+        // maxCruiseMmMin so the fastest axis never truly exceeds JOG_STEP_HZ).
+        float f_tick = fastest;
+        if (f_tick < float(JOG_MIN_STEP_HZ)) {
+            f_tick = float(JOG_MIN_STEP_HZ);
+        } else if (f_tick > float(JOG_STEP_HZ)) {
+            f_tick = float(JOG_STEP_HZ);
+        }
+
+        // Publish the timer period the jog branch of pulse_func programs each tick. Single aligned
+        // 32-bit store — atomic on Xtensa; a torn read against _inc[] below costs at most one tick of
+        // step mistiming, self-correcting on the next tick.
+        _isrPeriod = uint32_t(lroundf(float(Stepping::fStepperTimer) / f_tick));
+
+        // Per-axis fixed-point increment, now calibrated to f_tick (NOT the fixed JOG_STEP_HZ):
+        //   steps per ISR tick (Q16) = rate[steps/s] / f_tick * ONE.   The fastest axis lands at ~ONE.
+        for (int a = 0; a < MAX_N_AXIS; ++a) {
+            float inc = rate[a] * (float(ONE) / f_tick);
+            // Ceiling at one step/tick (the fastest axis sits here by construction; clamp guards
+            // float rounding from ever owing >1 step/tick).
+            if (inc > float(ONE)) {
+                inc = float(ONE);
+            } else if (inc < -float(ONE)) {
+                inc = -float(ONE);
             }
             _inc[a] = int32_t(lroundf(inc));  // single aligned 32-bit store — atomic on Xtensa
         }
@@ -87,6 +117,9 @@ namespace Machine {
             _acc[a] = 0;
             _inc[a] = 0;
         }
+        // Idle at the floor period until refill's first setVelocity publishes a real rate, so the
+        // first tick after wake_up doesn't fire at the previous jog's stale (fast) period.
+        _isrPeriod = Stepping::fStepperTimer / JOG_MIN_STEP_HZ;
         set_state(State::Jog);
         sys.step_control = {};   // no executeHold/executeSysMotion lingering; segment path stays dead
         Stepper::reset();        // clear st (step_outbits=0) and the segment buffer; go_idle internally

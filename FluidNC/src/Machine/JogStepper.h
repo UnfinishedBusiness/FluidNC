@@ -23,13 +23,27 @@
 namespace Machine {
     class JogStepper {
     public:
-        // Fixed step-ISR rate during a jog. Single-step-per-tick, so the max jog rate per axis is
+        // Step-ISR ceiling during a jog. Single-step-per-tick, so the max jog rate per axis is
         // JOG_STEP_HZ / steps_per_mm. The vector refill caps cruise to keep within this (so the
         // integrator's position can't outrun the steps). Raise if a high-steps/mm machine caps
         // below the desired jog speed (ISR budget permitting).
         static constexpr uint32_t JOG_STEP_HZ = 60000;
 
+        // Step-ISR floor during a jog. The ISR tick rate tracks the fastest axis's step rate (see
+        // setVelocity), but never drops below this — so at zero/low velocity the ISR idles here
+        // instead of pinning JOG_STEP_HZ. Pinning 60 kHz at v=0 (a tap whose $Jog/Stop lands during
+        // the ramp, the first ramp tick, or any stall) starved the main loop that runs BOTH refill()
+        // and serial RX, self-sustainingly wedging the machine in <Jog> until the backlog drained.
+        // 1 kHz matches the refill cadence (motion resumes within a refill tick) and is negligible
+        // next to the ~50 kHz idle baseline.
+        static constexpr uint32_t JOG_MIN_STEP_HZ = 1000;
+
         static bool active() { return _active; }
+
+        // Timer ticks per step-ISR tick (Machine::Stepping::fStepperTimer / f_tick), published by
+        // setVelocity and programmed by the jog branch of Stepper::pulse_func every tick. IRAM-safe
+        // (plain volatile load; inlined, no flash call).
+        static uint32_t isrPeriod() { return _isrPeriod; }
 
         // Current jog speed (mm/min) — the magnitude of the published velocity vector. Reported as
         // the `|FS:` feed in the `?` status while a direct jog runs (the planner, which normally
@@ -59,9 +73,10 @@ namespace Machine {
     private:
         static constexpr int32_t ONE = 1 << 16;  // fixed-point unit (Q16)
 
-        static volatile bool    _active;
-        static volatile int32_t _inc[MAX_N_AXIS];  // signed steps per tick, Q16 (sign = travel dir)
-        static int32_t          _acc[MAX_N_AXIS];   // ISR-private fractional-step accumulator (Q16)
-        static volatile float   _rateMmMin;         // |velocity| (mm/min) for the |FS: status field
+        static volatile bool     _active;
+        static volatile int32_t  _inc[MAX_N_AXIS];  // signed steps per tick, Q16 (sign = travel dir)
+        static int32_t           _acc[MAX_N_AXIS];   // ISR-private fractional-step accumulator (Q16)
+        static volatile float    _rateMmMin;         // |velocity| (mm/min) for the |FS: status field
+        static volatile uint32_t _isrPeriod;         // timer ticks/ISR tick — tracks the live step rate
     };
 }
