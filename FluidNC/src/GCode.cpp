@@ -1515,13 +1515,20 @@ Error gc_execute_line(const char* input_line) {
                         gc_block.values.r = hypot_f(gc_block.values.ijk[axis_0], gc_block.values.ijk[axis_1]);
                         // Compute difference between current location and target radii for final error-checks.
                         float delta_r = fabsf(target_r - gc_block.values.r);
-                        if (delta_r > 0.005) {
-                            if (delta_r > 0.5) {
-                                return Error::GcodeInvalidTarget;  // [Arc definition error] > 0.5mm
-                            }
-                            if (delta_r > (0.001 * gc_block.values.r)) {
-                                return Error::GcodeInvalidTarget;  // [Arc definition error] > 0.005mm AND 0.1% radius
-                            }
+                        // gc_state.position is the machine's ACTUAL step-quantized position: a successful probe /
+                        // homing / abort re-syncs every axis from step counts via gc_sync_position(), so an arc that
+                        // follows a probe starts up to half a step off the ideal point, and that residual flows 1:1
+                        // into delta_r.  Floor the tolerance at the plane's step resolution (full-step hypot = 2x the
+                        // half-step bound) so sub-step quantization can never reject a valid arc, while genuine CAM
+                        // errors (many steps) and the 0.5mm gross backstop still fail.
+                        auto  cfgAxes = config->_axes;
+                        float step0 =
+                            (cfgAxes && cfgAxes->_axis[axis_0]) ? (1.0f / cfgAxes->_axis[axis_0]->_stepsPerMm) : (1.0f / 80.0f);
+                        float step1 =
+                            (cfgAxes && cfgAxes->_axis[axis_1]) ? (1.0f / cfgAxes->_axis[axis_1]->_stepsPerMm) : (1.0f / 80.0f);
+                        float radius_tol = fmaxf(0.001f * gc_block.values.r, hypot_f(step0, step1));
+                        if (delta_r > 0.5f || delta_r > radius_tol) {
+                            return Error::GcodeInvalidTarget;  // [Arc definition error]
                         }
                     }
                     clear_bitnum(value_words, GCodeWord::P);
