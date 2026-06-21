@@ -22,6 +22,16 @@ namespace {
 
     float braking(float v, float a) { return (v * v) / (2.0f * a); }
 
+    // set_target now takes a SIGNED per-axis velocity array (mm/s). This helper preserves the old
+    // "unit direction × cruise feed (mm/min)" convenience for the trajectory-shape tests, which are
+    // about ramp/blend/overshoot and don't depend on the per-axis-clamp policy (that lives in the
+    // Jogging module and is covered in JoggingPlannerTest).
+    void set_target_vec(State& s, const float dir[3], float feed_mm_min) {
+        float v      = feed_mm_min * MM_MIN_TO_MM_S;
+        float tv[3]  = { dir[0] * v, dir[1] * v, dir[2] * v };
+        set_target(s, tv);
+    }
+
     // Integrate to rest (setpoint already zero / fenced) and return the X distance traveled.
     void run_to_rest(State& s, float accel, const float* lo = nullptr, const float* hi = nullptr) {
         for (int i = 0; i < 200000 && moving(s); ++i) {
@@ -35,7 +45,7 @@ namespace {
         float zero[3] = { 0, 0, 0 };
         seed(s, zero);
         float dir[3] = { 1, 0, 0 };
-        set_target(s, dir, feed_mm_min);
+        set_target_vec(s, dir, feed_mm_min);
         int ticks = int(hold_s / DT);
         for (int i = 0; i < ticks; ++i) {
             integrate_tick(s, accel, DT, nullptr, nullptr);
@@ -46,15 +56,64 @@ namespace {
     }
 }
 
-TEST(JogIntegrator, SetTargetDistributesAlongDirection) {
+TEST(JogIntegrator, SetTargetTakesSignedPerAxisVelocity) {
     State s;
     float zero[3] = { 0, 0, 0 };
     seed(s, zero);
-    float dir[3] = { 0.0f, 1.0f, 0.0f };
-    set_target(s, dir, 6000.0f);  // 100 mm/s
-    EXPECT_NEAR(s.targetVel[0], 0.0f, 1e-5f);
-    EXPECT_NEAR(s.targetVel[1], 100.0f, 1e-3f);
+    // Signed per-axis velocity (mm/s) is stored verbatim — no normalization, no shared cruise.
+    float tv[3] = { -40.0f, 100.0f, 0.0f };
+    set_target(s, tv);
+    EXPECT_NEAR(s.targetVel[0], -40.0f, 1e-5f);
+    EXPECT_NEAR(s.targetVel[1], 100.0f, 1e-5f);
     EXPECT_NEAR(s.targetVel[2], 0.0f, 1e-5f);
+}
+
+// Independence (Issue 2): each axis ramps toward its own target regardless of the others. Adding a
+// second axis must NOT change the first axis's target or the velocity it reaches.
+TEST(JogIntegrator, AxesRampIndependently) {
+    const float a = 1000.0f;
+
+    // X alone at 100 mm/s.
+    State sx;
+    float zero[3] = { 0, 0, 0 };
+    seed(sx, zero);
+    float xOnly[3] = { 100.0f, 0.0f, 0.0f };
+    set_target(sx, xOnly);
+    for (int i = 0; i < 500; ++i) {
+        integrate_tick(sx, a, DT, nullptr, nullptr);
+    }
+    ASSERT_NEAR(sx.vel[0], 100.0f, 1e-2f);
+
+    // X + Y, each commanded to 100 mm/s. X's target and settled velocity are unchanged by Y.
+    State sxy;
+    seed(sxy, zero);
+    float xy[3] = { 100.0f, 100.0f, 0.0f };
+    set_target(sxy, xy);
+    EXPECT_NEAR(sxy.targetVel[0], 100.0f, 1e-5f);  // X target NOT reduced by adding Y
+    for (int i = 0; i < 500; ++i) {
+        integrate_tick(sxy, a, DT, nullptr, nullptr);
+    }
+    EXPECT_NEAR(sxy.vel[0], 100.0f, 1e-2f);  // X reaches the SAME speed as when it ran alone
+    EXPECT_NEAR(sxy.vel[1], 100.0f, 1e-2f);  // Y independently reaches its own 100 mm/s
+    // The tool-tip speed is the vector magnitude — ~1.41x a single axis. That's the intended result.
+    EXPECT_NEAR(speed(sxy), 141.42f, 0.5f);
+}
+
+// Per-axis acceleration: with a faster X accel and slower Y accel, X reaches cruise first. The
+// integrate_tick accel[] array drives each axis at its own rate (no single vector accel).
+TEST(JogIntegrator, AxesUsePerAxisAcceleration) {
+    State s;
+    float zero[3] = { 0, 0, 0 };
+    seed(s, zero);
+    float tv[3] = { 100.0f, 100.0f, 0.0f };
+    set_target(s, tv);
+    float accel[3] = { 2000.0f, 250.0f, 250.0f };  // X 8x faster than Y
+    // After 0.1 s: X (2000 mm/s^2) is long since at 100; Y (250 mm/s^2) is only at ~25 mm/s.
+    for (int i = 0; i < 100; ++i) {
+        integrate_tick(s, accel, DT, nullptr, nullptr);
+    }
+    EXPECT_NEAR(s.vel[0], 100.0f, 1e-2f);  // X at cruise
+    EXPECT_NEAR(s.vel[1], 25.0f, 1.0f);    // Y still ramping at its own slower accel
 }
 
 TEST(JogIntegrator, RampReachesTargetNeverOvershoots) {
@@ -63,7 +122,7 @@ TEST(JogIntegrator, RampReachesTargetNeverOvershoots) {
     seed(s, zero);
     float dir[3]  = { 1, 0, 0 };
     const float v = 100.0f, a = 500.0f;  // mm/s, mm/s^2  -> reaches target in 0.2 s
-    set_target(s, dir, v * 60.0f);
+    set_target_vec(s, dir, v * 60.0f);
     bool reached = false;
     for (int i = 0; i < 1000; ++i) {
         integrate_tick(s, a, DT, nullptr, nullptr);
@@ -83,12 +142,12 @@ TEST(JogIntegrator, ReversalRampsThroughZeroSmoothly) {
     seed(s, zero);
     float dirP[3] = { 1, 0, 0 }, dirN[3] = { -1, 0, 0 };
     const float a = 500.0f;
-    set_target(s, dirP, 6000.0f);  // +100 mm/s
+    set_target_vec(s, dirP, 6000.0f);  // +100 mm/s
     for (int i = 0; i < 300; ++i) {
         integrate_tick(s, a, DT, nullptr, nullptr);  // settle at +100
     }
     ASSERT_NEAR(s.vel[0], 100.0f, 1e-2f);
-    set_target(s, dirN, 6000.0f);  // reverse to -100 mm/s
+    set_target_vec(s, dirN, 6000.0f);  // reverse to -100 mm/s
     float prev      = s.vel[0];
     bool  crossed0  = false;
     float maxStep   = 0.0f;
@@ -122,7 +181,7 @@ TEST(JogIntegrator, ReleaseOvershootIsBrakingDistance) {
     seed(s, zero);
     float dir[3]  = { 1, 0, 0 };
     const float v = 200.0f, a = 1000.0f;
-    set_target(s, dir, v * 60.0f);
+    set_target_vec(s, dir, v * 60.0f);
     for (int i = 0; i < 1000 && std::fabs(s.vel[0] - v) > 1e-2f; ++i) {
         integrate_tick(s, a, DT, nullptr, nullptr);
     }
@@ -139,7 +198,7 @@ TEST(JogIntegrator, ExtentDecelStopsAtFence) {
     seed(s, zero);
     float dir[3]  = { 1, 0, 0 };
     const float a = 1000.0f;
-    set_target(s, dir, 15240.0f);  // 254 mm/s toward a near fence
+    set_target_vec(s, dir, 15240.0f);  // 254 mm/s toward a near fence
     float lo[3] = { -1e9f, -1e9f, -1e9f };
     float hi[3] = { 10.0f, 1e9f, 1e9f };  // X soft-limit at +10 mm
     // Integrate from rest through the accel+decel (a fixed loop, not run_to_rest, which gates on
@@ -158,7 +217,7 @@ TEST(JogIntegrator, DiagonalSlidesAlongFence) {
     seed(s, zero);
     float dir[3]  = { 0.70710678f, 0.70710678f, 0.0f };  // +X+Y diagonal
     const float a = 1000.0f;
-    set_target(s, dir, 12000.0f);
+    set_target_vec(s, dir, 12000.0f);
     float lo[3] = { -1e9f, -1e9f, -1e9f };
     float hi[3] = { 5.0f, 1e9f, 1e9f };  // only X is fenced (near)
     for (int i = 0; i < 5000; ++i) {

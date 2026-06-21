@@ -50,10 +50,6 @@ namespace Machine {
         // supplies that, is bypassed). The DDA emits steps at exactly this rate.
         static float currentRateMmMin() { return _rateMmMin; }
 
-        // Highest cruise (mm/min) the DDA can emit along `dirUnit` without owing >1 step/axis/tick
-        // (i.e. without the integrator outrunning the steppers). Caller clamps cruise to this.
-        static float maxCruiseMmMin(const float dirUnit[MAX_N_AXIS]);
-
         // Begin direct-stepper jogging: clean stepper state, enter State::Jog, run the step timer
         // at JOG_STEP_HZ. Idempotent if already active.
         static void enter();

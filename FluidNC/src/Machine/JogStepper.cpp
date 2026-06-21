@@ -23,24 +23,6 @@ namespace Machine {
     // setVelocity publishes a real rate) idles at JOG_MIN_STEP_HZ rather than storming.
     volatile uint32_t JogStepper::_isrPeriod       = Stepping::fStepperTimer / JOG_MIN_STEP_HZ;
 
-    float JogStepper::maxCruiseMmMin(const float dirUnit[MAX_N_AXIS]) {
-        // The fastest axis (|dir|*steps_per_mm largest) must stay <= JOG_STEP_HZ steps/s. Solve for
-        // the vector feed (mm/s) at which it equals JOG_STEP_HZ, convert to mm/min.
-        auto  axes  = config->_axes;
-        float worst = 0.0f;  // steps per (mm of vector travel)
-        for (int a = 0; a < MAX_N_AXIS && a < Axes::_numberAxis; ++a) {
-            if (axes && axes->_axis[a]) {
-                float s = std::fabs(dirUnit[a]) * axes->_axis[a]->_stepsPerMm;
-                worst   = std::max(worst, s);
-            }
-        }
-        if (worst <= 0.0f) {
-            return 1.0e9f;  // no constraint (no active axis / no steps_per_mm)
-        }
-        float v_mm_s = float(JOG_STEP_HZ) / worst;  // mm/s where the fastest axis hits JOG_STEP_HZ
-        return v_mm_s * 60.0f;
-    }
-
     void JogStepper::setVelocity(const float vel_mm_s[3]) {
         // Publish the speed (mm/min) for the |FS: status field.
         float v2   = vel_mm_s[0] * vel_mm_s[0] + vel_mm_s[1] * vel_mm_s[1] + vel_mm_s[2] * vel_mm_s[2];
@@ -63,8 +45,9 @@ namespace Machine {
         // tick (max DDA resolution) and — the whole point of this engine's storm fix — at zero/low
         // velocity the rate collapses toward JOG_MIN_STEP_HZ instead of pinning JOG_STEP_HZ, so the
         // step ISR stops preempting the main loop (refill() + serial RX). Floor keeps it responsive
-        // to the next velocity update; ceiling guards rounding (cruise is already capped by
-        // maxCruiseMmMin so the fastest axis never truly exceeds JOG_STEP_HZ).
+        // to the next velocity update; ceiling guards rounding (each axis's target is already capped
+        // per-axis to JOG_STEP_HZ/steps_per_mm in Jogging::computeAxisTargetVel, so the fastest axis
+        // never truly exceeds JOG_STEP_HZ).
         float f_tick = fastest;
         if (f_tick < float(JOG_MIN_STEP_HZ)) {
             f_tick = float(JOG_MIN_STEP_HZ);

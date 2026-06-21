@@ -15,6 +15,7 @@
 #include "JogStepper.h"
 #include "Homing.h"
 
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 
@@ -50,44 +51,48 @@ namespace Machine {
         return _entryUnhomed && _allow_unhomed && homingRequired() && anyAxisUnhomed();
     }
 
-    bool Jogging::computeDirection() {
-        float len2 = 0.0f;
+    void Jogging::computeAxisTargetVel(float targetVel[3]) const {
+        // Per-axis INDEPENDENT velocity (Issue 2). Every commanded axis targets the wire feed F on
+        // its own, clamped only to its own max_rate and its own DDA step ceiling — there is no shared
+        // cruise and no vector normalization, so a diagonal runs each axis at (up to) F and the
+        // tool-tip speed legitimately exceeds F (~1.41xF for X+Y). Adding a second axis cannot slow
+        // the first.
+        float F_mm_s = _cruise_mm_min * JogMath::MM_MIN_TO_MM_S;
+        auto  axes   = config->_axes;
         for (int a = 0; a < 3; ++a) {
-            len2 += float(_vec[a]) * float(_vec[a]);
+            targetVel[a] = 0.0f;
+            if (_vec[a] == 0) {
+                continue;
+            }
+            float v  = F_mm_s;
+            auto  ax = (a < Axes::_numberAxis) ? axes->_axis[a] : nullptr;
+            if (ax) {
+                // Clamp to this axis's own max_rate (mm/min -> mm/s).
+                float maxRate_mm_s = ax->_maxRate * JogMath::MM_MIN_TO_MM_S;
+                if (maxRate_mm_s > 0.0f) {
+                    v = std::min(v, maxRate_mm_s);
+                }
+                // Per-axis DDA ceiling: the integer DDA emits at most one step/axis/tick, so this
+                // axis can step no faster than JOG_STEP_HZ -> JOG_STEP_HZ / steps_per_mm (mm/s). This
+                // replaces the old vector-wide JogStepper::maxCruiseMmMin with a true per-axis cap.
+                float spmm = ax->_stepsPerMm;
+                if (spmm > 0.0f) {
+                    v = std::min(v, float(JogStepper::JOG_STEP_HZ) / spmm);
+                }
+            }
+            targetVel[a] = (_vec[a] > 0 ? 1.0f : -1.0f) * v;
         }
-        if (len2 <= 0.0f) {
-            return false;
-        }
-        float inv = 1.0f / std::sqrt(len2);
-        for (int a = 0; a < 3; ++a) {
-            _dirUnit[a] = float(_vec[a]) * inv;
-        }
-        return true;
     }
 
-    float Jogging::vectorAccel() const {
-        // Limiting (smallest) acceleration across the active axes, mm/s^2.
-        float accel = 0.0f;
-        auto  axes  = config->_axes;
-        for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-            if (_dirUnit[a] != 0.0f && axes->_axis[a]) {
-                float ax = axes->_axis[a]->_acceleration;
-                accel    = (accel == 0.0f) ? ax : std::min(accel, ax);
-            }
+    void Jogging::computeAxisAccel(float accel[3]) const {
+        // Per-axis acceleration (mm/s^2): each axis ramps/decels at its OWN configured acceleration,
+        // including the integrator's proactive soft-limit decel. No single min-accel for the vector.
+        auto axes = config->_axes;
+        for (int a = 0; a < 3; ++a) {
+            auto  ax = (a < Axes::_numberAxis) ? axes->_axis[a] : nullptr;
+            float v  = (ax && ax->_acceleration > 0.0f) ? ax->_acceleration : 100.0f;
+            accel[a] = v;
         }
-        return accel > 0.0f ? accel : 100.0f;
-    }
-
-    float Jogging::effectiveCruise() const {
-        // Clamp the requested cruise so no active axis exceeds its max_rate along the vector.
-        float maxRate[3] = { 0, 0, 0 };
-        auto  axes       = config->_axes;
-        for (int a = 0; a < 3 && a < Axes::_numberAxis; ++a) {
-            if (axes->_axis[a]) {
-                maxRate[a] = axes->_axis[a]->_maxRate;
-            }
-        }
-        return JogMath::clamp_feed_to_axis_rates(_cruise_mm_min, _dirUnit, maxRate);
     }
 
     Error Jogging::startVector(const JogCommand::Vector& v, Channel& out) {
@@ -100,8 +105,8 @@ namespace Machine {
         _vec[0] = v.axis[0];
         _vec[1] = v.axis[1];
         _vec[2] = v.axis[2];
-        if (!computeDirection()) {
-            return Error::InvalidStatement;  // error:3
+        if (!anyCommandedAxis()) {
+            return Error::InvalidStatement;  // error:3 (zero vector)
         }
         _cruise_mm_min = v.feed_mm_min;
         // log_debug, NOT log_info: a joystick/shuttle sender issues many $Jog/Start per second (one per
@@ -111,14 +116,20 @@ namespace Machine {
         log_debug("JogStart received: X" << int(_vec[0]) << " Y" << int(_vec[1]) << " Z" << int(_vec[2]) << " F" << v.feed_mm_min
                                          << " state=" << state_name());
 
+        // NON-BLOCKING ENTRY (Issue 1): the command handler does NO motion-engine work. It only
+        // validates, stashes the vector/feed, flips the phase flag, and returns Ok so the ack fires
+        // IMMEDIATELY. The heavy stepper setup (seed + JogStepper::enter -> Stepper::reset/wake_up +
+        // set_state(Jog) + arm the LEVEL3 step-timer ISR) happens one tick (~1 ms) later in the
+        // refill pump (refillVectorDirect), which runs in the motion-loop context off the
+        // command/ack path. Running enter() here is what wedged the line channel in <Jog> with zero
+        // motion for ~2.5 s. Do NOT call refill()/enter()/seed() from this handler.
         if (_phase == Phase::Stopping) {
             // Re-press during a ramp-down (rapid tap / quick reversal): resume directly. The
             // integrator still carries the current velocity and JogStepper is still active, so
-            // flipping back to Jogging blends from the live velocity toward the new vector — no wait
-            // for a full stop, no re-seed. (This is the LinuxCNC "tap it again and it speeds back
-            // up" feel.)
+            // flipping back to Jogging lets the pump blend from the live velocity toward the new
+            // vector — no wait for a full stop, no re-seed. (The LinuxCNC "tap it again and it speeds
+            // back up" feel.)
             _phase = Phase::Jogging;
-            refill();
             return Error::Ok;
         }
 
@@ -128,11 +139,11 @@ namespace Machine {
                 // Permit motion from Alarm:Unhomed WITHOUT clearing the unhomed flags (unlike $X,
                 // which calls set_all_axes_homed()). The jog end restores Alarm:Unhomed. There is
                 // no soft-limit envelope while unhomed (position is unknown). (See docs/jogging.md.)
+                // This is a cheap state flag, not motion-engine work — safe on the ack path.
                 set_state(State::Idle);
             }
         }
         _phase = Phase::Jogging;
-        refill();  // first tick seeds the integrator + JogStepper::enter()
         return Error::Ok;
     }
 
@@ -140,8 +151,9 @@ namespace Machine {
         if (_phase != Phase::Jogging) {
             return Error::Ok;  // no-op when not jogging (per protocol)
         }
+        // Stash only — the refill pump applies the new feed on its next tick. Like startVector, this
+        // keeps all motion-engine work off the command/ack path (Issue 1).
         _cruise_mm_min = feed_mm_min;
-        refill();
         return Error::Ok;
     }
 
@@ -181,7 +193,8 @@ namespace Machine {
             return;  // idempotent — safe to call from multiple termination sites
         }
         JogStepper::exit();  // direct-stepper jog: stop the step timer + resync position (no-op if inactive)
-        _phase = Phase::Idle;
+        _phase      = Phase::Idle;
+        _stallTicks = 0;     // clear the anti-wedge watchdog on every teardown
         resetIntegrator();   // next vector jog re-seeds the trajectory from the machine position
 
         // The direct-stepper integrator bypasses the planner/suspend system entirely, so its teardown
@@ -237,24 +250,35 @@ namespace Machine {
             return;
         }
 
-        float accel = vectorAccel();
+        // Per-axis acceleration (each axis ramps/decels at its own configured accel).
+        float accel[3];
+        computeAxisAccel(accel);
 
         // First tick of a fresh jog: seed the integrator at the live position and enter direct mode
-        // (sets State::Jog and wakes the step timer at JOG_STEP_HZ).
+        // (sets State::Jog and wakes the step timer at JOG_STEP_HZ). This is the heavy stepper setup
+        // the non-blocking handler deliberately deferred to here (Issue 1) — it runs in the
+        // motion-loop context, off the command/ack path.
         if (!_integ.primed) {
             JogIntegrator::seed(_integ, gc_state.position);
             JogStepper::enter();
+            _stallTicks = 0;  // fresh entry: arm the anti-wedge watchdog from zero
         }
 
+        float maxTargetVel = 0.0f;  // largest commanded per-axis target this tick (mm/s), for the watchdog
         if (_phase == Phase::Jogging) {
-            float cruise = effectiveCruise();
-            // Cap cruise so the DDA never owes more than one step/axis/tick (keeps the integrator's
-            // position from outrunning the steps it commands).
-            cruise        = std::min(cruise, JogStepper::maxCruiseMmMin(_dirUnit));
-            JogIntegrator::set_target(_integ, _dirUnit, cruise);
-            _lastTargetMm = cruise * JogMath::MM_MIN_TO_MM_S;  // |JogQ target speed (mm/s)
+            // Independent per-axis target velocity: each commanded axis targets F clamped to its own
+            // max_rate and its own DDA step ceiling (no vector normalization, no shared cruise).
+            float targetVel[3];
+            computeAxisTargetVel(targetVel);
+            JogIntegrator::set_target(_integ, targetVel);
+            for (int a = 0; a < 3; ++a) {
+                maxTargetVel = std::max(maxTargetVel, std::fabs(targetVel[a]));
+            }
+            // |JogQ target speed: the commanded wire feed F (mm/s). The current speed reported
+            // alongside it is the true tool-tip magnitude, which on a diagonal legitimately exceeds F.
+            _lastTargetMm = _cruise_mm_min * JogMath::MM_MIN_TO_MM_S;
         } else {
-            JogIntegrator::release(_integ);  // Phase::Stopping — ramp the velocity vector to rest
+            JogIntegrator::release(_integ);  // Phase::Stopping — ramp each axis's velocity to rest
             _lastTargetMm = 0.0f;
         }
 
@@ -281,7 +305,27 @@ namespace Machine {
 
         JogIntegrator::integrate_tick(_integ, accel, JOG_TICK_S, pMin, pMax);
         JogStepper::setVelocity(_integ.vel);
-        _lastRunwayMm = JogIntegrator::speed(_integ);  // |JogQ current speed (mm/s)
+        float curSpeed = JogIntegrator::speed(_integ);
+        _lastRunwayMm  = curSpeed;  // |JogQ current speed (mm/s)
+
+        // Anti-wedge watchdog (Issue 1, belt-and-suspenders). If a held jog is commanding a real
+        // per-axis target (> EPS) yet the integrator produces no motion (< EPS) for JOG_STALL_TICKS
+        // consecutive ticks (~250 ms of the integrator's fixed-tick time, orders of magnitude above
+        // the ~1-tick ramp out of EPS), force teardown to Idle. This makes "in <Jog> with zero
+        // velocity, no motion" impossible by construction even for a never-before-seen trigger:
+        // a positive setpoint that never yields steps cannot persist. A genuinely slow setpoint
+        // (target <= EPS) and the ramp-to-rest (Phase::Stopping) never trip it.
+        constexpr int JOG_STALL_TICKS = 250;
+        if (_phase == Phase::Jogging && maxTargetVel > JogIntegrator::EPS_V_MM_S && curSpeed < JogIntegrator::EPS_V_MM_S) {
+            if (++_stallTicks > JOG_STALL_TICKS) {
+                log_warn("jog stall watchdog: forced idle");
+                set_state(State::Idle);  // onMotionTerminated does the Alarm:Unhomed round-trip if needed
+                onMotionTerminated();
+                return;
+            }
+        } else {
+            _stallTicks = 0;
+        }
 
         // Ramp-to-rest complete: back to Idle, exit the stepper, resync planner+gcode position.
         if (_phase == Phase::Stopping && !JogIntegrator::moving(_integ)) {

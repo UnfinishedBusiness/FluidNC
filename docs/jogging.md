@@ -33,8 +33,11 @@ a planner-fed jog feel wrong (cornering chokes, motion is inconsistent). Instead
 **stepgen**, the same model LinuxCNC uses:
 
 - A per-axis **velocity integrator** (`JogIntegrator.h`, ported from GcodePilot's proven host-side
-  jog planner) runs in the ~1 kHz refill tick: each axis slews its velocity toward
-  `direction × cruise` at the accel limit and integrates independently.
+  jog planner) runs in the ~1 kHz refill tick. Each commanded axis independently slews its velocity
+  toward its **own** target — the wire feed `F` applied **per axis**, clamped only to that axis's own
+  `max_rate` and its own step ceiling — at that axis's **own** acceleration, and integrates its
+  position. There is no shared cartesian cruise and no vector normalization, so the axes are fully
+  decoupled (see *Per-axis independent velocity* below).
 - Each tick it publishes the per-axis velocity (mm/s) to `JogStepper`, which converts it to a
   fixed-point step increment and runs an **integer DDA inside the step ISR** (`Stepper::pulse_func`
   → `JogIntegrator::dda_step`): each axis accumulates and emits a step when it crosses one full
@@ -49,12 +52,35 @@ This is what delivers the RC-car feel:
 - **Cornering sweeps a smooth arc.** A direction change re-aims the setpoint; each axis slews its
   own velocity (ramping through zero on a reversal), so the resultant velocity *vector* rotates
   smoothly and the path is a blended arc, never an angular "S-curve."
-- **Flat velocity at any speed.** Once an axis reaches cruise the DDA emits steps at a constant
-  rate — there is no queue to starve, so no flutter. Cruise is capped to `JogStepper::JOG_STEP_HZ
-  / steps_per_mm` so the DDA never owes more than one step/axis/tick.
+- **Flat velocity at any speed.** Once an axis reaches its target the DDA emits steps at a constant
+  rate — there is no queue to starve, so no flutter. Each axis's target is capped to
+  `JogStepper::JOG_STEP_HZ / steps_per_mm` (per axis) so the DDA never owes more than one
+  step/axis/tick.
 - **Smooth, minimal stop.** `$Jog/Stop` and realtime `0x85` set the velocity setpoint to zero; the
   integrator ramps each axis to rest at the accel limit (overshoot `v²/2a`, the physical minimum).
   A re-press during the ramp-down resumes from the live velocity (tap-and-speed-back-up).
+
+#### Per-axis independent velocity
+
+Jogging is **per-axis independent velocity**, exactly like LinuxCNC's per-joint jog — **not** a
+cartesian vector. The single wire feed `F` is interpreted **per axis**: every commanded axis targets
+`F` on its own, clamped only to **its own** `max_rate` and **its own** DDA step ceiling
+(`JOG_STEP_HZ / steps_per_mm`), and ramps at **its own** `acceleration`. There is no shared cruise,
+no normalized direction vector, and no single min-acceleration for the move.
+
+The consequences are deliberate:
+
+- **Adding a second axis never slows the first.** A held X jog at `F` keeps running at `F` the
+  instant you add Y; Y independently ramps up to its own `F`. (The old cartesian engine normalized
+  the vector and split one cruise across the axes, so a diagonal dropped each axis's speed — that is
+  gone.)
+- **A diagonal's tool-tip speed exceeds `F`.** With X and Y each at `F`, the resultant tip speed is
+  `√2 · F` (~1.41×). This is the correct, intended result of independent per-axis velocity — the
+  `|FS` field reports the true tip speed and the `|JogQ` field reports it against the commanded `F`,
+  so a diagonal legitimately shows current-speed > target.
+- **Each axis is clamped to its own limits.** On a machine with a slow axis, an `F` above that axis's
+  `max_rate` runs the fast axis at full `F` while the slow axis is capped to its own `max_rate` —
+  independently, with no cross-axis coupling.
 
 When the jog ends, `JogStepper::exit()` resyncs the planner and gcode parser to the stepped
 position (`gc_sync_position(); plan_sync_position();`, the same recipe homing uses) so the next
@@ -92,8 +118,19 @@ Allowed states: `Idle`, `Jog` (re-issue `Start` to change direction mid-jog), or
 `Alarm:Unhomed` carve-out above. A disallowed state returns `error:9`; a malformed
 vector/feed returns `error:3`.
 
-The cruise feed is clamped so no active axis exceeds its `max_rate` along the vector
-(`feed ≤ min(max_rate[a]/|dir[a]|)`), then the queue-holdable cap is applied.
+The feed `F` is applied **per axis independently**: each commanded axis targets `F` clamped to its
+own `max_rate` and its own DDA step ceiling (`JOG_STEP_HZ / steps_per_mm`), and ramps at its own
+`acceleration`. See *Per-axis independent velocity* above — a diagonal's tool-tip speed is the
+vector sum and legitimately exceeds `F`.
+
+> **Non-blocking entry.** `$Jog/Start`, `$Jog/Feed`, and `$Jog/Stop` are deliberately cheap on the
+> command/ack path: the handler only validates, stashes the vector/feed, and flips a phase flag,
+> then returns `ok` **immediately**. The heavy motion-engine setup (seed the integrator,
+> `JogStepper::enter()` → `Stepper::reset/wake_up` + arm the step-timer ISR + `set_state(Jog)`) runs
+> one ~1 ms refill tick later in the motion-loop pump, **off** the line-execution/ack path. Doing
+> that setup synchronously in the handler could wedge the command channel in `<Jog>` with no motion
+> until it self-recovered — the bug this design removes by construction. See *Lifecycle &
+> termination*.
 
 ### Machine extents
 
@@ -122,6 +159,15 @@ the system terminates motion (soft-reset and alarm handlers, gated to FWJOG buil
 `JogStepper::exit()` to stop the step timer and resync position immediately rather than at the
 next tick.
 
+**3. Anti-wedge stall watchdog.** Paired with the non-blocking entry (above), a watchdog in the
+refill pump guarantees the machine can **never** sit in `<Jog>` with zero velocity. If a jog is held
+with a real per-axis target commanded yet the integrator produces no motion for ~250 ms (counted in
+the integrator's fixed-tick time), the engine logs `jog stall watchdog: forced idle` and force-tears
+down to `Idle`. A genuinely slow setpoint and the normal ramp-to-rest never trip it; the realistic
+trigger is a jog commanded straight into a soft-limit fence the axis is already parked on (no motion
+is physically possible). This makes the "`<Jog>` with no motion" wedge impossible by construction
+rather than dependent on patching any single trigger.
+
 Termination matrix:
 
 | Action while jogging | Result |
@@ -132,6 +178,7 @@ Termination matrix:
 | Alarm (limit, etc.) | engine terminates |
 | `$X` unlock *after* an alarmed jog | does **not** resume the old jog |
 | Quick tap | only the brief ramp is stepped — bounded by press time, no committed runway |
+| Held with a target but no motion possible (~250 ms) | stall watchdog force-tears down to `Idle` |
 
 On exit the engine **resyncs the planner + gcode position** to the stepped position
 (`gc_sync_position(); plan_sync_position();`), so the next program/`$J=` move starts correctly.
@@ -154,13 +201,14 @@ Alarm:Unhomed — passive detection alone made the jog source nondeterministic a
 
 ## Velocity hold & step rate
 
-There is no planner queue to starve, so held velocity is flat by construction — once at cruise the
+There is no planner queue to starve, so held velocity is flat by construction — once at target the
 DDA emits steps at a constant rate. The cap is the step-ISR rate: `JogStepper::JOG_STEP_HZ`
-(default 60 kHz) bounds the max jog rate per axis to `JOG_STEP_HZ / steps_per_mm`, and the
-commanded cruise is clamped to that (`JogStepper::maxCruiseMmMin`) so the DDA never owes more than
-one step/axis/tick. Raise `JOG_STEP_HZ` (ISR budget permitting) if a high-`steps_per_mm` machine
-caps below the desired jog speed. The `?` status reports `|JogQ:<speed>,<target-speed>` (mm/s)
-while a vector jog runs.
+(default 60 kHz) bounds the max jog rate per axis to `JOG_STEP_HZ / steps_per_mm`, and each axis's
+target velocity is clamped to that **per axis** (in `Jogging::computeAxisTargetVel`) so the DDA never
+owes more than one step/axis/tick. Raise `JOG_STEP_HZ` (ISR budget permitting) if a
+high-`steps_per_mm` machine caps below the desired jog speed. The `?` status reports
+`|JogQ:<speed>,<target-speed>` (mm/s) while a vector jog runs — `<speed>` is the true tool-tip
+magnitude (vector sum, so > `F` on a diagonal) and `<target-speed>` is the commanded per-axis `F`.
 
 A re-press during the ramp-down resumes directly from the live velocity (no wait for a full stop),
 so rapid taps and quick reversals feel continuous.

@@ -57,10 +57,16 @@ namespace Machine {
         enum class Phase { Idle, Jogging, Stopping };
 
         Phase  _phase            = Phase::Idle;
-        int8_t _vec[3]           = { 0, 0, 0 };
-        float  _dirUnit[3]       = { 0, 0, 0 };  // normalized jog vector (XYZ)
-        float  _cruise_mm_min    = 0.0f;         // requested cruise (pre per-axis clamp)
+        int8_t _vec[3]           = { 0, 0, 0 };  // commanded per-axis direction (XYZ), each -1/0/+1
+        float  _cruise_mm_min    = 0.0f;         // requested wire feed F, applied to each axis independently
         bool   _entryUnhomed     = false;        // started from Alarm:Unhomed -> return there on stop
+
+        // Anti-wedge watchdog: consecutive refill ticks where the jog is held with a real per-axis
+        // target commanded but the integrator is producing no motion. Counted in the integrator's own
+        // fixed-tick time (JOG_TICK_S), reset on entry and whenever motion is seen; if it ever exceeds
+        // JOG_STALL_TICKS the engine force-tears-down to Idle so the machine can NEVER sit in <Jog>
+        // with zero velocity (Issue 1, made impossible by construction). See refillVectorDirect.
+        int _stallTicks = 0;
 
         // Velocity-setpoint trajectory (LinuxCNC-style ramp/blend; see JogIntegrator.h). Carried
         // across direction/feed changes (the integrator blends); reset on every teardown.
@@ -79,12 +85,14 @@ namespace Machine {
         bool canStartUnhomedJog() const;
         // True while the active vector jog is the Alarm:Unhomed carve-out.
         bool unhomedJogExceptionActive() const;
-        // Per-axis-clamped cruise (mm/min) for the current vector.
-        float effectiveCruise() const;
-        // Limiting acceleration (mm/s^2) across the active axes of the current vector.
-        float vectorAccel() const;
-        // Compute _dirUnit from _vec; returns false if zero vector.
-        bool  computeDirection();
+        // True if any axis is commanded (non-zero _vec); a zero vector is an invalid jog.
+        bool anyCommandedAxis() const { return _vec[0] != 0 || _vec[1] != 0 || _vec[2] != 0; }
+        // Signed per-axis target velocity (mm/s) for the current jog: each commanded axis targets the
+        // wire feed F, clamped only to ITS OWN max_rate and ITS OWN single-step-per-tick DDA ceiling.
+        // No cross-axis coupling — this is what makes a second axis not slow the first (Issue 2).
+        void computeAxisTargetVel(float targetVel[3]) const;
+        // Per-axis acceleration (mm/s^2): each axis ramps/decels at its own configured acceleration.
+        void computeAxisAccel(float accel[3]) const;
 
         // refill() is the re-entrancy-guarded shell; refillImpl() is the real body.
         bool _inRefill = false;

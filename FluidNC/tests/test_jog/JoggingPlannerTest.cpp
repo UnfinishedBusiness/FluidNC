@@ -8,6 +8,7 @@
 extern const EnumItem messageLevels2[];
 
 #include "Machine/Jogging.h"
+#include "Machine/JogStepper.h"  // mocked below; needed for the static-member definitions
 #include "Machine/MachineConfig.h"
 #include "Machine/Axis.h"
 #include "Machine/Homing.h"
@@ -144,6 +145,16 @@ void send_alarm(ExecAlarm alarm) {
     set_state(State::Alarm);
 }
 
+// Soft-limit fences. Only the stall-watchdog test enables Axis::_softLimits (default false), so for
+// every other test these are never consulted. A fence at 0 (max) with a far min lets that test park
+// an axis on its fence and command further into it — the integrator then produces no motion.
+float limitsMaxPosition(axis_t) {
+    return 0.0f;
+}
+float limitsMinPosition(axis_t) {
+    return -1000.0f;
+}
+
 // The real planner/suspend system global. Jogging::onMotionTerminated() now hands it back clean
 // (clears step_control + the jog-blocking suspend bits) so a subsequent classic $J= jog isn't wedged
 // by stale state left from a firmware vector jog. System.cpp isn't in the test src filter, so define
@@ -152,19 +163,23 @@ system_t sys;
 
 // Mock the direct-stepper engine. Vector jogs now drive JogStepper (the integer DDA in the step
 // ISR) instead of the planner, so there are no plannedLines for a vector jog. Track active state
-// and the peak published velocity so tests assert the new contract. enter() mirrors the real one
-// (State::Jog + active); the integer DDA itself is covered by JogIntegratorTest (dda_step).
-float jogVelMaxMmS = 0.0f;
+// and the peak published velocity — both the overall magnitude and PER AXIS, so tests can assert
+// the new per-axis-independent contract (Issue 2). enter() mirrors the real one (State::Jog +
+// active); the integer DDA itself is covered by JogIntegratorTest (dda_step). The vector-wide
+// maxCruiseMmMin is gone — the DDA step ceiling is now a per-axis clamp inside Jogging.
+float jogVelMaxMmS  = 0.0f;
+float jogVelPeak[3] = { 0.0f, 0.0f, 0.0f };  // per-axis peak |published velocity| (mm/s)
 namespace Machine {
     volatile bool    JogStepper::_active          = false;
     volatile int32_t JogStepper::_inc[MAX_N_AXIS] = { 0 };
     int32_t          JogStepper::_acc[MAX_N_AXIS] = { 0 };
 
-    float JogStepper::maxCruiseMmMin(const float*) { return 1.0e9f; }  // no DDA cap in the host test
-    void  JogStepper::isr_compute(AxisMask&, AxisMask&) {}
-    void  JogStepper::setVelocity(const float v[3]) {
-        float m      = std::max({ std::fabs(v[0]), std::fabs(v[1]), std::fabs(v[2]) });
-        jogVelMaxMmS = std::max(jogVelMaxMmS, m);
+    void JogStepper::isr_compute(AxisMask&, AxisMask&) {}
+    void JogStepper::setVelocity(const float v[3]) {
+        for (int a = 0; a < 3; ++a) {
+            jogVelPeak[a] = std::max(jogVelPeak[a], std::fabs(v[a]));
+        }
+        jogVelMaxMmS = std::max({ jogVelPeak[0], jogVelPeak[1], jogVelPeak[2] });
     }
     void JogStepper::enter() {
         _active = true;
@@ -194,6 +209,7 @@ namespace {
             testMotionEnding   = false;
             flushCount         = 0;
             jogVelMaxMmS       = 0.0f;
+            jogVelPeak[0] = jogVelPeak[1] = jogVelPeak[2] = 0.0f;
             Machine::JogStepper::exit();  // ensure not active between tests
             lastAlarm          = ExecAlarm::None;
             testState          = State::Idle;
@@ -211,7 +227,11 @@ namespace {
             Machine::Axes::homingMask        = 0;
 
             for (auto* axis : { &x, &y, &z }) {
-                axis->_maxRate      = 10000.0f;
+                // Generous per-axis max_rate (500 mm/s) so the new per-axis velocity clamp does NOT
+                // cap the feeds these ramp tests use (up to 200 mm/s); the per-axis clamp itself is
+                // asserted explicitly in PerAxisClampIsIndependent. _stepsPerMm defaults to 80, so
+                // the per-axis DDA ceiling (JOG_STEP_HZ/80 = 750 mm/s) is also out of the way.
+                axis->_maxRate      = 30000.0f;
                 axis->_acceleration = 500.0f;
             }
 
@@ -237,12 +257,17 @@ namespace {
             return jogging.startVector(v, fakeChannel());
         }
 
-        // Start a vector jog. startVector's synchronous refill enters direct-stepper mode
-        // (JogStepper mock sets State::Jog + active), so the jog is live on return.
+        // Start a vector jog. The handler is now NON-BLOCKING (Issue 1): startVector only flips the
+        // phase flag and returns Ok — it does NO stepper work. The refill pump's first tick does the
+        // seed + JogStepper::enter() (State::Jog + active), exactly as in the firmware. So we pump one
+        // refill here to bring the engine fully live before the test proceeds.
         void establishJog(float feed) {
             setHomingEnabled(true);
             ASSERT_EQ(startX(feed), Error::Ok);
-            ASSERT_TRUE(jogging.active());
+            ASSERT_TRUE(jogging.active());               // phase flipped on the ack path
+            ASSERT_FALSE(Machine::JogStepper::active());  // ...but NO stepper work in the handler
+            jogging.refill();                             // pump's first tick: seed + enter()
+            ASSERT_TRUE(Machine::JogStepper::active());    // now live (State::Jog)
         }
 
         // Pump the ~1 kHz refill tick n times (the integrator ramps velocity toward the setpoint;
@@ -403,6 +428,76 @@ namespace {
         EXPECT_EQ(flushCount, flushBefore);  // direction change never flushes
         pumpRefills(400);
         EXPECT_TRUE(jogging.active());
+    }
+
+    // ---- Issue 2: per-axis INDEPENDENT velocity ----
+
+    // Adding a second axis must NOT slow the first. X alone reaches its commanded F; with Y added at
+    // the same F, X reaches the SAME speed (no cartesian-vector slow-down) and Y independently
+    // reaches its own F. The tool-tip speed on the diagonal is the vector sum (~1.41xF) — intended.
+    TEST_F(JoggingPlannerTest, AddingSecondAxisDoesNotSlowFirst) {
+        setHomingEnabled(true);
+        const float feed = 12000.0f;  // 200 mm/s, well under the 500 mm/s axis max_rate
+
+        // X alone.
+        Machine::JogCommand::Vector vx;
+        vx.axis[0]     = 1;
+        vx.feed_mm_min = feed;
+        ASSERT_EQ(jogging.startVector(vx, fakeChannel()), Error::Ok);
+        pumpRefills(3000);
+        EXPECT_NEAR(jogVelPeak[0], 200.0f, 1.0f);  // X reaches its own F
+        float xAlone = jogVelPeak[0];
+
+        // Re-aim to X+Y at the SAME feed. X's target/velocity is unchanged by adding Y.
+        jogVelPeak[0] = jogVelPeak[1] = 0.0f;
+        Machine::JogCommand::Vector vxy;
+        vxy.axis[0]     = 1;
+        vxy.axis[1]     = 1;
+        vxy.feed_mm_min = feed;
+        ASSERT_EQ(jogging.startVector(vxy, fakeChannel()), Error::Ok);
+        pumpRefills(3000);
+        EXPECT_NEAR(jogVelPeak[0], xAlone, 1.0f);  // X NOT slowed by the second axis
+        EXPECT_NEAR(jogVelPeak[1], 200.0f, 1.0f);  // Y independently reaches its own F
+    }
+
+    // Each axis is clamped to ITS OWN max_rate, not a shared vector cruise: with X fast and Y slow,
+    // an X+Y jog at F above Y's max_rate runs X at the full F while Y is capped to its own max_rate.
+    TEST_F(JoggingPlannerTest, PerAxisClampIsIndependent) {
+        setHomingEnabled(true);
+        x._maxRate = 30000.0f;  // 500 mm/s
+        y._maxRate = 6000.0f;   // 100 mm/s — below the commanded feed
+
+        Machine::JogCommand::Vector v;
+        v.axis[0]     = 1;
+        v.axis[1]     = 1;
+        v.feed_mm_min = 12000.0f;  // 200 mm/s commanded
+        ASSERT_EQ(jogging.startVector(v, fakeChannel()), Error::Ok);
+        pumpRefills(3000);
+        EXPECT_NEAR(jogVelPeak[0], 200.0f, 1.0f);  // X gets the full commanded F (its max is higher)
+        EXPECT_NEAR(jogVelPeak[1], 100.0f, 1.0f);  // Y clamped to ITS OWN max_rate, independently
+    }
+
+    // ---- Issue 1: anti-wedge watchdog ----
+
+    // If a held jog commands a real per-axis target yet the integrator produces no motion (here: the
+    // axis is parked exactly on its soft-limit fence and commanded further into it, so it can never
+    // step), the engine must NOT sit in <Jog> at zero velocity forever — the watchdog force-tears it
+    // down to Idle. This makes the "in <Jog>, no motion" wedge impossible by construction.
+    TEST_F(JoggingPlannerTest, StallWatchdogForcesIdleWhenNoMotionPossible) {
+        setHomingEnabled(true);
+        x._softLimits = true;  // fence at 0 (limitsMaxPosition), machine parked there (mpos/gc 0)
+
+        Machine::JogCommand::Vector v;
+        v.axis[0]     = 1;  // jog +X, straight into the max fence we're already sitting on
+        v.feed_mm_min = 12000.0f;
+        ASSERT_EQ(jogging.startVector(v, fakeChannel()), Error::Ok);
+
+        // The integrator can produce no motion (target zeroed at the fence every tick). Pump well past
+        // the ~250-tick stall threshold; the watchdog must force teardown to Idle.
+        pumpRefills(400);
+        EXPECT_FALSE(jogging.active());
+        EXPECT_FALSE(Machine::JogStepper::active());
+        EXPECT_EQ(testState, State::Idle);
     }
 }
 

@@ -97,13 +97,15 @@ namespace Machine {
             s.primed      = true;
         }
 
-        // Set the velocity setpoint from a unit direction and a cruise feed (mm/min) that the caller
-        // has ALREADY clamped to per-axis max rates / unhomed cap (JogMath::clamp_feed_to_axis_rates).
-        // A direction change mid-jog just calls this again; the integrator blends toward the new vector.
-        inline void set_target(State& s, const float dirUnit[3], float cruise_mm_min) {
-            float v = cruise_mm_min * MM_MIN_TO_MM_S;
+        // Set the velocity setpoint directly from a SIGNED per-axis target velocity (mm/s) that the
+        // caller has ALREADY clamped per axis (own max_rate, own DDA step ceiling). Each axis is
+        // independent — there is no shared cruise and no vector normalization, so adding a second
+        // axis never slows the first (a diagonal's tool-tip speed legitimately exceeds any single
+        // axis's target). A direction/feed change mid-jog just calls this again; the integrator
+        // blends each axis toward its new target.
+        inline void set_target(State& s, const float targetVel_mm_s[3]) {
             for (int a = 0; a < 3; ++a) {
-                s.targetVel[a] = dirUnit[a] * v;
+                s.targetVel[a] = targetVel_mm_s[a];
             }
         }
 
@@ -112,18 +114,21 @@ namespace Machine {
         // host-testable for the minimal-overshoot release assertion.)
         inline void release(State& s) { s.targetVel[0] = s.targetVel[1] = s.targetVel[2] = 0.0f; }
 
-        // Advance one tick. accel = limiting accel (mm/s^2), dt seconds.
+        // Advance one tick. accel[3] = per-axis acceleration (mm/s^2), dt seconds — each axis ramps,
+        // decelerates, and proactively brakes for a fence at its OWN acceleration (true independent
+        // per-joint stepgen, the LinuxCNC model).
         // limMin/limMax (nullable, parallel): per-axis absolute soft-limit envelope in machine mm.
         //   When provided, an axis proactively decelerates so it stops AT its fence (stopDist =
         //   v^2/2a vs distance-to-fence), then its position is hard-clamped to the envelope and its
         //   velocity zeroed if it lands on the fence. Pass nullptr to disable (soft limits off /
         //   unhomed free-jog carve-out). Axes with no fence get a large sentinel from the caller.
-        inline void integrate_tick(State& s, float accel, float dt, const float* limMin, const float* limMax) {
+        inline void integrate_tick(State& s, const float accel[3], float dt, const float* limMin, const float* limMax) {
             float step2 = 0.0f;
             for (int a = 0; a < 3; ++a) {
-                float target = s.targetVel[a];
-                if (limMin && limMax && accel > 0.0f) {
-                    float stopDist = (s.vel[a] * s.vel[a]) / (2.0f * accel);
+                float target  = s.targetVel[a];
+                float accel_a = accel[a];
+                if (limMin && limMax && accel_a > 0.0f) {
+                    float stopDist = (s.vel[a] * s.vel[a]) / (2.0f * accel_a);
                     // Proactive decel: only when actually MOVING toward a fence and unable to stop
                     // before it. Keyed on the velocity sign — NOT a bare >=0, which at rest (vel==0)
                     // would always pick the max fence and wrongly block a jog heading the other way
@@ -141,7 +146,7 @@ namespace Machine {
                         target = 0.0f;
                     }
                 }
-                float dv = accel * dt;
+                float dv = accel_a * dt;
                 if (s.vel[a] < target) {
                     s.vel[a] = std::min(target, s.vel[a] + dv);
                 } else if (s.vel[a] > target) {
@@ -162,6 +167,14 @@ namespace Machine {
                 step2 += d * d;
             }
             s.accDist += std::sqrt(step2);
+        }
+
+        // Convenience overload: a single isotropic acceleration applied to all three axes. The live
+        // firmware path passes a per-axis array (each axis its own accel); this keeps the host tests
+        // and any isotropic caller terse.
+        inline void integrate_tick(State& s, float accel, float dt, const float* limMin, const float* limMax) {
+            const float accel3[3] = { accel, accel, accel };
+            integrate_tick(s, accel3, dt, limMin, limMax);
         }
 
         // The runway to keep queued ahead of the executing point at the current speed.
