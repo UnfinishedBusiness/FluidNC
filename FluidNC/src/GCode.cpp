@@ -278,6 +278,7 @@ Error gc_execute_line(const char* input_line) {
     bool probeExplicit        = false;
     bool probeAway            = false;
     bool probeNoError         = false;
+    ProbeSource probe_source  = ProbeSource::Both;  // {G38 D<sel>} which probe input(s) this cycle watches
     bool syncLaser            = false;
     bool disableLaser         = false;
     bool laserIsMotion        = false;
@@ -799,9 +800,9 @@ Error gc_execute_line(const char* input_line) {
                         }
                         break;
 
-                    case 'D':  // Unsupported word used for parameter debugging
-                        axis_word_bit = GCodeWord::D;
-                        log_info("Value is " << value);
+                    case 'D':  // {G38} probe-input selector (per-block). Validated in the G38 block below.
+                        axis_word_bit     = GCodeWord::D;
+                        gc_block.values.d = value;
                         break;
                     case 'E':
                         axis_word_bit     = GCodeWord::E;
@@ -1555,6 +1556,21 @@ Error gc_execute_line(const char* input_line) {
                     }
                     clear_bitnum(value_words, GCodeWord::P);  // allow P to be used
 
+                    // [G38 D<sel>]: optional, per-block probe-input selector. 0/omitted = both inputs
+                    // (the default OR), 1 = floating-head (probe.pin), 2 = ohmic (toolsetter_pin). Validate
+                    // the value and that the selected input's pin is configured; the cycle restores Both on
+                    // exit so the mask can't leak. (The D word bit is cleared globally below with O.)
+                    if (bitnum_is_true(value_words, GCodeWord::D)) {
+                        int sel = int(gc_block.values.d);
+                        if (sel < 0 || sel > 2 || float(sel) != gc_block.values.d) {
+                            return Error::GcodeValueWordInvalid;  // [D must be 0, 1, or 2]
+                        }
+                        probe_source = ProbeSource(sel);
+                        if (!config->_probe->sourcePinDefined(probe_source)) {
+                            return Error::GcodeValueWordMissing;  // [Selected probe input pin not configured]
+                        }
+                    }
+
                     if (!axis_words) {
                         return Error::GcodeNoAxisWords;  // [No axis words]
                     }
@@ -1978,7 +1994,8 @@ Error gc_execute_line(const char* input_line) {
                 if (!ALLOW_FEED_OVERRIDE_DURING_PROBE_CYCLES) {
                     pl_data->motion.noFeedOverride = 1;
                 }
-                gc_update_pos = mc_probe_cycle(gc_block.values.xyz, pl_data, probeAway, probeNoError, axis_words, gc_block.values.p);
+                gc_update_pos =
+                    mc_probe_cycle(gc_block.values.xyz, pl_data, probeAway, probeNoError, axis_words, gc_block.values.p, probe_source);
             }
             // As far as the parser is concerned, the position is now == target. In reality the
             // motion control system might still be processing the action and the real tool position

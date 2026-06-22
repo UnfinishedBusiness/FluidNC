@@ -39,8 +39,15 @@ void mc_arc(float*            target,
 // Dwell for a specific number of seconds
 bool mc_dwell(int32_t milliseconds);
 
-// Perform tool length probe cycle. Requires probe switch.
-GCUpdatePos mc_probe_cycle(float* target, plan_line_data_t* pl_data, bool away, bool no_error, AxisMask offsetAxis, float offset);
+// Perform tool length probe cycle. Requires probe switch. `source` selects which probe input(s) the
+// cycle watches (per-block `G38.n D<sel>`); it is applied for this cycle only and restored to Both on exit.
+GCUpdatePos mc_probe_cycle(float*            target,
+                           plan_line_data_t* pl_data,
+                           bool              away,
+                           bool              no_error,
+                           AxisMask          offsetAxis,
+                           float             offset,
+                           ProbeSource       source = ProbeSource::Both);
 
 // Handles updating the override control state.
 void mc_override_ctrl_update(Override override_state);

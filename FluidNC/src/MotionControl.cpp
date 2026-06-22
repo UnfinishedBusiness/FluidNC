@@ -281,7 +281,7 @@ bool probe_succeeded = false;
 
 // Perform tool length probe cycle. Requires probe switch.
 // NOTE: Upon probe failure, the program will be stopped and placed into ALARM state.
-GCUpdatePos mc_probe_cycle(float* target, plan_line_data_t* pl_data, bool away, bool no_error, AxisMask offsetAxis, float offset) {
+GCUpdatePos mc_probe_cycle(float* target, plan_line_data_t* pl_data, bool away, bool no_error, AxisMask offsetAxis, float offset, ProbeSource source) {
     if (!config->_probe->exists()) {
         log_error("Probe pin is not configured");
         return GCUpdatePos::None;
@@ -301,12 +301,16 @@ GCUpdatePos mc_probe_cycle(float* target, plan_line_data_t* pl_data, bool away, 
     // Initialize probing control variables
     probe_succeeded = false;  // Re-initialize probe history before beginning cycle.
     config->_probe->set_direction(away);
+    // Apply the per-block probe-input selector for this cycle only. Set BEFORE the pre-trigger check
+    // below so that, too, honors the mask, and restored to Both on every exit path so it never leaks.
+    config->_probe->setSource(source);
     // After syncing, check if probe is already triggered. If so, halt and issue alarm.
     // NOTE: This probe initialization error applies to all probing cycles.
     if (config->_probe->tripped()) {
         send_alarm(ExecAlarm::ProbeFailInitial);
         protocol_execute_realtime();
         Stepping::endLowLatency();
+        config->_probe->setSource(ProbeSource::Both);
         return GCUpdatePos::None;  // Nothing else to do but bail.
     }
     // Setup and queue probing motion. Auto cycle-start should not start the cycle.
@@ -319,6 +323,7 @@ GCUpdatePos mc_probe_cycle(float* target, plan_line_data_t* pl_data, bool away, 
         protocol_execute_realtime();
         if (sys.abort()) {
             Stepping::endLowLatency();
+            config->_probe->setSource(ProbeSource::Both);
             return GCUpdatePos::None;  // Check for system abort
         }
     } while (!state_is(State::Idle));
@@ -346,6 +351,10 @@ GCUpdatePos mc_probe_cycle(float* target, plan_line_data_t* pl_data, bool away, 
         // All done! Output the probe position as message.
         report_probe_parameters(allChannels);
     }
+
+    // Cycle complete — restore the default OR so the input selector stays strictly per-block. Placed
+    // ahead of both remaining returns (success/fail) below so neither path can leak the mask.
+    config->_probe->setSource(ProbeSource::Both);
 
     if (probe_succeeded) {
         if (offset != __FLT_MAX__) {

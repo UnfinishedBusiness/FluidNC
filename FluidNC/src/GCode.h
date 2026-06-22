@@ -293,6 +293,7 @@ struct gc_modal_t {
 
 struct gc_values_t {
     uint8_t  e;                // {M66,M67}
+    float    d;                // {G38} probe-input selector (0/omitted=both, 1=floating head, 2=ohmic)
     float    f;                // Feed
     float    ijk[3];           // I,J,K Axis arc offsets - only 3 are possible
     uint8_t  l;                // {M66,G10}, or canned cycles parameters

@@ -21,8 +21,17 @@ void Probe::set_direction(bool away) {
 }
 
 // Returns the probe pin state. Triggered = true. Called by gcode parser.
+// Honors the transient per-cycle _source so a `G38.n D<sel>` block can watch a single input; with the
+// default (Both) this is the original OR of both inputs.
 bool Probe::get_state() {
-    return _probePin.get() || _toolsetterPin.get();
+    switch (_source) {
+        case ProbeSource::ProbeOnly:
+            return _probePin.get();
+        case ProbeSource::ToolsetterOnly:
+            return _toolsetterPin.get();
+        default:  // Both
+            return _probePin.get() || _toolsetterPin.get();
+    }
 }
 
 // Returns true if the probe pin is tripped, accounting for the direction (away or not).
