@@ -36,6 +36,22 @@ namespace Machine {
     // without any ESP32 hardware.
     ThcAction thcDecide(const ThcInputs& in, float pid_p, float min_rate_hz, float max_rate_hz, float& rate_hz_out);
 
+    // ---- Override mode (set live from GcodePilot over real-time commands) ----
+    // Gcode    : the program's M101/M102/M103 are in charge (the default).
+    // Override : GcodePilot's target volts replace the M103 setpoint; arming still
+    //            follows M101/M102.
+    // Disabled : THC is forced off regardless of M101 (M101/M102 become no-ops).
+    enum class ThcOvrMode : int { Gcode = 0, Override = 1, Disabled = 2 };
+
+    struct ThcResolved {
+        float target_volts;  // setpoint the control loop should hold
+        bool  armed;         // whether the loop may correct at all
+    };
+
+    // Resolve the effective setpoint + armed state from the override mode and the
+    // G-code state. Pure (unit-tested on the native build).
+    ThcResolved thcResolve(ThcOvrMode mode, float m103_target, float ovr_volts, bool m101_enabled);
+
     // ---------------------------- The THC feature ----------------------------
 
     // Torch Height Control.  When a `thc:` section is present in the machine config
@@ -65,6 +81,36 @@ namespace Machine {
         float arcVoltage() const { return _arc_volts.load(); }
         bool  active() const { return _active.load(); }
 
+        // ---- Override API (driven by GcodePilot real-time commands) ----
+        // The currently-effective target (override volts when overriding, else the M103 value).
+        float effectiveTarget() const {
+            return thcResolve((ThcOvrMode)_ovr_mode.load(), _target_volts.load(), _ovr_volts.load(), _enabled.load())
+                .target_volts;
+        }
+        // Nudge the override setpoint by dvolts. The first nudge out of Gcode/Disabled mode
+        // seeds the override from the currently-effective target so +/- starts where the DRO is.
+        void ovrNudge(int dvolts) {
+            if ((ThcOvrMode)_ovr_mode.load() != ThcOvrMode::Override) {
+                _ovr_volts.store(effectiveTarget());
+                _ovr_mode.store((int)ThcOvrMode::Override);
+            }
+            float v = _ovr_volts.load() + (float)dvolts;
+            if (v < 0.0f) {
+                v = 0.0f;
+            }
+            if (v > 300.0f) {
+                v = 300.0f;
+            }
+            _ovr_volts.store(v);
+        }
+        void ovrSetGcode() { _ovr_mode.store((int)ThcOvrMode::Gcode); }
+        void ovrSetDisabled() { _ovr_mode.store((int)ThcOvrMode::Disabled); }
+
+        // ---- Manual Z compensation (RT comp up/down/stop during a cut) ----
+        void manualCompUp() { _manual_dir.store(1); }
+        void manualCompDown() { _manual_dir.store(-1); }
+        void manualCompStop() { _manual_dir.store(0); }
+
     private:
         // ---- Configuration (YAML) ----
         Pin   _arc_voltage_pin;          // analog input carrying (divided) arc voltage
@@ -80,6 +126,7 @@ namespace Machine {
         float _max_z_rate_mm_min = 600.0f; // caps the injected Z rate
         int   _avg_samples       = 5;      // moving-average window
         bool  _invert_z          = false;  // set if +Z lowers the torch on this machine
+        float _manual_comp_rate_mm_min = 600.0f;  // Z rate for manual comp (RT comp up/down)
 
         // ---- Runtime state shared across contexts ----
         std::atomic<bool>  _enabled { false };
@@ -87,6 +134,11 @@ namespace Machine {
         std::atomic<float> _arc_volts { 0.0f };
         std::atomic<bool>  _arc_ok { false };
         std::atomic<bool>  _active { false };
+
+        // ---- Override state (set from GcodePilot real-time commands) ----
+        std::atomic<int>   _ovr_mode { (int)ThcOvrMode::Gcode };
+        std::atomic<float> _ovr_volts { 0.0f };
+        std::atomic<int>   _manual_dir { 0 };  // +1 up, -1 down, 0 stop
 
         // ---- Control loop (ESP32 only) ----
         void service();    // 1 kHz: read voltage, decide direction + rate
@@ -105,6 +157,7 @@ namespace Machine {
         float    _step_phase = 0.0f;              // phase accumulator for pacing
 
         float    _max_rate_hz = 0.0f;             // derived from _max_z_rate_mm_min and Z steps/mm
+        float    _manual_rate_hz = 0.0f;          // derived from _manual_comp_rate_mm_min and Z steps/mm
 
 #ifdef __FLUIDNC
         static void serviceTimerCb(void* arg);

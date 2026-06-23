@@ -55,6 +55,21 @@ namespace Machine {
         return (error > 0.0f) ? ThcAction::Up : ThcAction::Down;
     }
 
+    ThcResolved thcResolve(ThcOvrMode mode, float m103_target, float ovr_volts, bool m101_enabled) {
+        switch (mode) {
+            case ThcOvrMode::Disabled:
+                // Forced off: M101/M102 are no-ops. Report the M103 target so the DRO
+                // still shows what the program asked for.
+                return { m103_target, false };
+            case ThcOvrMode::Override:
+                // GcodePilot's volts replace M103; arming still follows M101/M102.
+                return { ovr_volts, m101_enabled };
+            case ThcOvrMode::Gcode:
+            default:
+                return { m103_target, m101_enabled };
+        }
+    }
+
     // ------------------------------- lifecycle -------------------------------
 
     THC::~THC() {}
@@ -73,6 +88,7 @@ namespace Machine {
         handler.item("max_z_rate_mm_min", _max_z_rate_mm_min);
         handler.item("avg_samples", _avg_samples, 1, 16);
         handler.item("invert_z", _invert_z);
+        handler.item("manual_comp_rate_mm_min", _manual_comp_rate_mm_min);
     }
 
     void THC::init() {
@@ -96,6 +112,10 @@ namespace Machine {
         _max_rate_hz      = (_max_z_rate_mm_min / 60.0f) * zStepsPerMm;
         if (_max_rate_hz > (float)StepTimerHz) {
             _max_rate_hz = (float)StepTimerHz;
+        }
+        _manual_rate_hz = (_manual_comp_rate_mm_min / 60.0f) * zStepsPerMm;
+        if (_manual_rate_hz > (float)StepTimerHz) {
+            _manual_rate_hz = (float)StepTimerHz;
         }
         _target_volts.store(_default_target);
 
@@ -174,12 +194,26 @@ namespace Machine {
             }
         }
 
+        // Manual compensation overrides the control loop: while a comp direction is held,
+        // drive Z up/down at the manual rate regardless of arc voltage. GcodePilot switches
+        // the override to Disabled before sending comp commands, so the loop is already idle.
+        int manual = _manual_dir.load();
+        if (manual != 0) {
+            int mdir = _invert_z ? -manual : manual;
+            _step_dir.store(mdir);
+            _step_rate_hz.store(_manual_rate_hz);
+            _active.store(false);  // manual move, not an automatic correction
+            return;
+        }
+
+        ThcResolved eff = thcResolve((ThcOvrMode)_ovr_mode.load(), _target_volts.load(), _ovr_volts.load(), _enabled.load());
+
         ThcInputs in;
         in.avg_volts       = avg;
-        in.target_volts    = _target_volts.load();
+        in.target_volts    = eff.target_volts;
         in.threshold_volts = _threshold_volts;
         in.min_volts       = _min_arc_voltage;
-        in.enabled         = _enabled.load();
+        in.enabled         = eff.armed;
         in.arc_ok          = ok;
         in.stabilized      = stabilized;
         in.antidive        = antidive;
@@ -217,13 +251,18 @@ namespace Machine {
 
     // ------------------------------- reporting -------------------------------
 
-    // |Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>
-    //   voltage = measured arc volts; arc_ok = arc-OK input; active = currently correcting Z;
-    //   target  = set target volts (M103 Q); enabled = armed (M101=1 / M102=0).
+    // |Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>,<ovrMode>
+    //   voltage  = measured arc volts; arc_ok = arc-OK input; active = currently correcting Z;
+    //   target   = effective target volts (override volts when overriding, else M103 Q);
+    //   enabled  = effective armed (0 when override mode is Disabled, else M101=1 / M102=0);
+    //   ovrMode  = GcodePilot override mode (0 Gcode, 1 Override, 2 Disabled).
+    // target/enabled carry the *effective* values so the GcodePilot DRO follows naturally.
     void THC::status_report(LogStream& msg) {
+        ThcResolved eff =
+            thcResolve((ThcOvrMode)_ovr_mode.load(), _target_volts.load(), _ovr_volts.load(), _enabled.load());
         msg << "|Arc:" << setprecision(1) << _arc_volts.load() << "," << (_arc_ok.load() ? 1 : 0) << ","
-            << (_active.load() ? 1 : 0) << "," << setprecision(1) << _target_volts.load() << ","
-            << (_enabled.load() ? 1 : 0);
+            << (_active.load() ? 1 : 0) << "," << setprecision(1) << eff.target_volts << "," << (eff.armed ? 1 : 0)
+            << "," << _ovr_mode.load();
     }
 
 #ifdef __FLUIDNC

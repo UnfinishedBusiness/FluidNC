@@ -44,6 +44,14 @@ enum class Cmd : uint8_t {
     SpindleOvrStop        = 0x9E,
     CoolantFloodOvrToggle = 0xA0,
     CoolantMistOvrToggle  = 0xA1,
+    // Plasma AVTHC override (GcodePilot). All ack-free, safe to send during a cut.
+    ThcVoltPlus           = 0xA2,  // override target +1V (seeds from effective target, enters Override)
+    ThcVoltMinus          = 0xA3,  // override target -1V
+    ThcGcode              = 0xA4,  // mode -> Gcode Controlled (clear override)
+    ThcDisable            = 0xA5,  // mode -> Disabled (M101/M102 become no-ops)
+    ThcManualUp           = 0xA6,  // manual Z comp up (continuous, while running)
+    ThcManualDown         = 0xA7,  // manual Z comp down
+    ThcManualStop         = 0xA8,  // stop manual Z comp
     // Channel Extender uses the Bx range; see Channel.h
 };
 

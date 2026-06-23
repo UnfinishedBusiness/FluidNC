@@ -4,7 +4,9 @@
 #include "Protocol.h"
 #include "Report.h"
 #include "System.h"
-#include "Machine/Macros.h"  // macroNEvent
+#include "State.h"                     // State, state_is
+#include "Machine/Macros.h"           // macroNEvent
+#include "Machine/MachineConfig.h"    // config->_thc
 #ifdef ENABLE_FW_JOG
 #    include "Machine/MachineConfig.h"  // config->_jogging
 #    include "Machine/Jogging.h"
@@ -113,6 +115,43 @@ void execute_realtime_command(Cmd command, Channel& channel) {
             break;
         case Cmd::Macro3:
             protocol_send_event(&macro3Event);
+            break;
+        // ---- Plasma AVTHC override (atomic stores; safe to call from the channel task) ----
+        case Cmd::ThcVoltPlus:
+            if (config && config->_thc) {
+                config->_thc->ovrNudge(+1);
+            }
+            break;
+        case Cmd::ThcVoltMinus:
+            if (config && config->_thc) {
+                config->_thc->ovrNudge(-1);
+            }
+            break;
+        case Cmd::ThcGcode:
+            if (config && config->_thc) {
+                config->_thc->ovrSetGcode();
+            }
+            break;
+        case Cmd::ThcDisable:
+            if (config && config->_thc) {
+                config->_thc->ovrSetDisabled();
+            }
+            break;
+        case Cmd::ThcManualUp:
+            // Manual comp only moves Z while a program is running, so a stray byte can't drift Z when idle.
+            if (config && config->_thc && state_is(State::Cycle)) {
+                config->_thc->manualCompUp();
+            }
+            break;
+        case Cmd::ThcManualDown:
+            if (config && config->_thc && state_is(State::Cycle)) {
+                config->_thc->manualCompDown();
+            }
+            break;
+        case Cmd::ThcManualStop:
+            if (config && config->_thc) {
+                config->_thc->manualCompStop();
+            }
             break;
         default:  // None
             break;

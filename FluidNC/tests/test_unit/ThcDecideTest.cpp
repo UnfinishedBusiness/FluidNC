@@ -8,6 +8,9 @@
 using Machine::ThcAction;
 using Machine::ThcInputs;
 using Machine::thcDecide;
+using Machine::ThcOvrMode;
+using Machine::ThcResolved;
+using Machine::thcResolve;
 
 namespace {
 
@@ -111,4 +114,35 @@ TEST(ThcDecide, RateFlooredToMin) {
     ThcAction act      = thcDecide(in, 0.1f /*pid_p*/, kMinRate, kMaxRate, rate);
     EXPECT_EQ(act, ThcAction::Up);
     EXPECT_FLOAT_EQ(rate, kMinRate);  // 0.1*1 = 0.1 -> floored to 1
+}
+
+// ---- thcResolve: effective setpoint + armed state per override mode ----
+
+TEST(ThcResolve, GcodeUsesM103AndM101) {
+    // m103_target=120, override volts ignored, armed follows M101 (enabled).
+    ThcResolved r = thcResolve(ThcOvrMode::Gcode, 120.0f, 99.0f, true);
+    EXPECT_FLOAT_EQ(r.target_volts, 120.0f);
+    EXPECT_TRUE(r.armed);
+
+    r = thcResolve(ThcOvrMode::Gcode, 120.0f, 99.0f, false);  // M102
+    EXPECT_FLOAT_EQ(r.target_volts, 120.0f);
+    EXPECT_FALSE(r.armed);
+}
+
+TEST(ThcResolve, OverrideReplacesTargetButKeepsArming) {
+    // Override volts (137) replace M103 (120); arming still follows M101/M102.
+    ThcResolved r = thcResolve(ThcOvrMode::Override, 120.0f, 137.0f, true);
+    EXPECT_FLOAT_EQ(r.target_volts, 137.0f);
+    EXPECT_TRUE(r.armed);
+
+    r = thcResolve(ThcOvrMode::Override, 120.0f, 137.0f, false);
+    EXPECT_FLOAT_EQ(r.target_volts, 137.0f);
+    EXPECT_FALSE(r.armed);  // M102 still disarms even with an override voltage
+}
+
+TEST(ThcResolve, DisabledForcesOff) {
+    // Disabled: never armed even when M101 is on; reports the M103 target for the DRO.
+    ThcResolved r = thcResolve(ThcOvrMode::Disabled, 120.0f, 137.0f, true);
+    EXPECT_FLOAT_EQ(r.target_volts, 120.0f);
+    EXPECT_FALSE(r.armed);
 }

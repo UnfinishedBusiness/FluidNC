@@ -58,6 +58,7 @@ thc:
   max_z_rate_mm_min: 600          # caps the injected Z correction rate
   avg_samples: 5                  # arc-voltage moving-average window
   invert_z: false                 # set true if +Z lowers the torch on your machine
+  manual_comp_rate_mm_min: 600    # Z rate for manual comp (RT comp up/down) — see Operator override
 ```
 
 ## How the control loop behaves
@@ -78,13 +79,49 @@ Inside those gates a proportional term (`pid_p`) sets the Z step rate, capped by
 `max_z_rate_mm_min`. Voltage low → raise the torch (more arc gap); voltage high →
 lower it.
 
+## Operator override (real-time)
+
+A sender (GcodePilot) can override the program's AVTHC live during a cut, without
+disturbing the streamed G-code, using **ack-free real-time command bytes**. These are
+picked off the serial stream like the feed/spindle override bytes — they never produce an
+`ok`, so they're safe to send while a program is running.
+
+| byte   | command | effect |
+|--------|---------|--------|
+| `0xA2` | THC volt + | override target **+1 V**. The first nudge out of Gcode/Disabled mode seeds the override from the current effective target and switches to **Override** mode. |
+| `0xA3` | THC volt − | override target **−1 V** (same seeding). |
+| `0xA4` | THC Gcode | mode → **Gcode Controlled** — clears the override; `M101/M102/M103` are back in charge. |
+| `0xA5` | THC Disable | mode → **Disabled** — THC is forced off; `M101/M102` become no-ops for the rest of the run. |
+| `0xA6` | Manual comp up | move Z **up** continuously at `manual_comp_rate_mm_min` (only while `State == Cycle`). |
+| `0xA7` | Manual comp down | move Z **down** continuously. |
+| `0xA8` | Manual comp stop | stop manual comp. |
+
+**Override modes** (reported as `ovrMode` in the status field below):
+
+- **Gcode Controlled (0)** — default. Effective target = `M103 Q`; armed = `M101/M102`.
+- **Override (1)** — effective target = the operator's override volts; arming still follows
+  `M101/M102`. Entered automatically by the first `+/−1 V` nudge or a verbatim set (a burst
+  of `+/−1 V` bytes walking to the target — there is no value-carrying byte, so resolution is
+  1 V).
+- **Disabled (2)** — THC forced off; `M101`/`M102` ignored.
+
+**Manual compensation** drives Z directly (reusing the THC step-injection path), independent
+of arc voltage — for finishing a cut on warped stock or a nearly-dead consumable. It only
+moves Z while a program is running (`State == Cycle`). GcodePilot switches the override to
+**Disabled** before sending comp commands so the control loop is already idle and the handoff
+is seamless; the operator clicks back to auto when done.
+
+> ⚠️ Manual comp and `Disabled` mode remove automatic height control mid-cut — the torch can
+> dive into or climb off the plate. Manual comp requires the same direct-GPIO `timed` Z step
+> engine as THC itself (see *Z motion injection* below).
+
 ## Status reporting
 
 When `thc:` is present, **every** `?` status report carries an arc field so a sender
 can drive a live DRO and AVTHC indicators:
 
 ```
-|Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>
+|Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>,<ovrMode>
 ```
 
 | idx | field   | type        | meaning |
@@ -92,10 +129,15 @@ can drive a live DRO and AVTHC indicators:
 | 0   | voltage | float (1dp) | measured arc voltage (scaled engineering volts) |
 | 1   | arc_ok  | `0`/`1`     | arc-OK input asserted |
 | 2   | active  | `0`/`1`     | THC is **currently correcting Z** (all control gates passed) |
-| 3   | target  | float (1dp) | **set target voltage** (`M103 Q`; `0` until set) |
-| 4   | enabled | `0`/`1`     | **AVTHC armed** (`M101`=1 / `M102`=0) |
+| 3   | target  | float (1dp) | **effective target voltage** — override volts when overriding, else `M103 Q` (`0` until set) |
+| 4   | enabled | `0`/`1`     | **effective armed** — `0` when override mode is Disabled, else `M101`=1 / `M102`=0 |
+| 5   | ovrMode | `0`/`1`/`2` | operator override mode: `0` Gcode Controlled, `1` Override, `2` Disabled |
 
-Example: `|Arc:123.4,1,1,120.0,1`.
+Example: `|Arc:123.4,1,1,120.0,1,0`.
+
+`target` and `enabled` carry the **effective** values (after the override mode is applied), so a
+sender DRO that already reads them follows the override automatically; `ovrMode` tells the sender
+which mode the firmware is in so it can reflect the override UI state.
 
 **`enabled` vs `active`:** `enabled` is the operator's intent (armed via `M101`); `active`
 is true only while the loop is *actually moving Z* (enabled **and** arc-OK **and** past the
@@ -108,9 +150,10 @@ means correction is effectively off even when `enabled=1` (the firmware's THC-OF
 
 ### Sender mapping
 
-Parse the `|Arc:` CSV → `{ voltage, arcOk, active, target, enabled }`. Positions 0-2 are
-unchanged from earlier firmware, and 3-4 are additive — a 3-field `|Arc:` from an older build
-still parses (treat missing `target` as unset and `enabled` as `0`).
+Parse the `|Arc:` CSV → `{ voltage, arcOk, active, target, enabled, ovrMode }`. Positions 0-2
+are unchanged from earlier firmware, and 3-5 are additive — a 3-field `|Arc:` from an older build
+still parses (treat missing `target`/`enabled`/`ovrMode` as unset). Send the operator-override
+bytes from the *Operator override* table above to drive it live.
 
 ## Z motion injection — requirements
 
