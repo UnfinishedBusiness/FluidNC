@@ -35,7 +35,7 @@ namespace Machine {
         //    At end-of-cut the arc-OK input typically lingers a few ms after the arc
         //    voltage has already collapsed toward 0; without this gate `error` would be
         //    full-scale and the THC would slam Z at max rate off a non-physical reading.
-        //  - arc not yet stable (still within the post-pierce delay)
+        //  - arc not yet stable (hasn't traveled the engage distance yet)
         //  - velocity anti-dive active (feed dropped through a corner)
         if (!in.enabled || !in.arc_ok || in.target_volts <= in.min_volts || in.avg_volts < in.min_volts ||
             !in.stabilized || in.antidive) {
@@ -89,7 +89,7 @@ namespace Machine {
         handler.item("threshold_volts", _threshold_volts);
         handler.item("pid_p", _pid_p);
         handler.item("vad_threshold_pct", _vad_threshold_pct, 0, 100);
-        handler.item("thc_delay_ms", _thc_delay_ms, 0, 10000);
+        handler.item("thc_engage_distance_mm", _thc_engage_distance_mm, 0.0f, 100.0f);
         handler.item("max_z_rate_mm_min", _max_z_rate_mm_min);
         handler.item("avg_samples", _avg_samples, 1, 16);
         handler.item("invert_z", _invert_z);
@@ -183,17 +183,28 @@ namespace Machine {
 #ifdef __FLUIDNC
         now = esp_timer_get_time();
 #endif
+        // Distance gate: accumulate path length traveled since the arc established. The torch
+        // is stationary through the pierce dwell (realtime rate ~0), so distance only grows once
+        // cutting motion resumes — pierce duration (which scales with thickness) drops out.
+        float realtime = Stepper::get_realtime_rate();  // vector XY feed, mm/min
         if (ok && !_arc_ok_prev) {
-            _arc_ok_since_us = now;
+            _arc_distance_mm = 0.0f;  // arc just rose — start measuring path length
+            _last_service_us = now;
         }
-        _arc_ok_prev    = ok;
-        bool stabilized = ok && (now - _arc_ok_since_us) >= (int64_t)_thc_delay_ms * 1000;
+        if (ok) {
+            int64_t dt_us = now - _last_service_us;
+            if (dt_us > 0) {
+                _arc_distance_mm += (realtime / 60.0f) * (dt_us * 1e-6f);
+            }
+        }
+        _last_service_us = now;
+        _arc_ok_prev     = ok;
+        bool stabilized  = ok && (_arc_distance_mm >= _thc_engage_distance_mm);
 
         // velocity anti-dive: suppress while the feed has dropped through a corner
         bool antidive = false;
         if (_vad_threshold_pct > 0) {
             float programmed = gc_state.feed_rate;
-            float realtime   = Stepper::get_realtime_rate();
             if (programmed > 0.0f && realtime < programmed * (_vad_threshold_pct / 100.0f)) {
                 antidive = true;
             }

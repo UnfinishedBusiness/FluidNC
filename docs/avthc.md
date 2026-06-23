@@ -54,7 +54,7 @@ thc:
   threshold_volts: 2.0            # deadband around the target (no motion inside it)
   pid_p: 10.0                     # proportional gain (volts -> step rate)
   vad_threshold_pct: 65           # velocity anti-dive (0 disables); see below
-  thc_delay_ms: 300               # stabilization delay after arc-ok before correcting
+  thc_engage_distance_mm: 10      # path distance (mm) after arc-on before correcting
   max_z_rate_mm_min: 600          # caps the injected Z correction rate
   avg_samples: 5                  # arc-voltage moving-average window
   invert_z: false                 # set true if +Z lowers the torch on your machine
@@ -68,7 +68,11 @@ A background loop samples the arc voltage (moving-averaged) and moves Z only whe
 
 - THC is enabled (`M101`) and the **arc-ok** input is asserted.
 - The target is above `min_arc_voltage`.
-- The post-arc **stabilization delay** (`thc_delay_ms`) has elapsed.
+- The torch has traveled the **engage distance** (`thc_engage_distance_mm`) of cut path
+  since arc-on. The path length is integrated from the realtime feed rate, so the
+  stationary pierce dwell does not count — this gates on distance cut, not elapsed time,
+  which keeps engagement consistent across material thicknesses (thicker stock pierces
+  longer but still engages after the same distance of travel).
 - **Velocity anti-dive** is not active. When the actual feed drops below
   `vad_threshold_pct` of the programmed feed (e.g. decelerating into a corner), the
   arc voltage rises for reasons unrelated to height, so correction is suspended to

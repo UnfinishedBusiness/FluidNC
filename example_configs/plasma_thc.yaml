@@ -67,7 +67,7 @@ thc:
   threshold_volts: 2.0            # deadband around the target
   pid_p: 10.0                     # proportional gain (volts -> step rate)
   vad_threshold_pct: 65           # velocity anti-dive; 0 disables
-  thc_delay_ms: 300               # stabilization delay after the arc establishes
+  thc_engage_distance_mm: 10      # path distance (mm) after arc-on before THC engages
   max_z_rate_mm_min: 600          # caps the injected Z correction rate
   avg_samples: 5                  # arc-voltage moving-average window
   invert_z: false                 # set true if +Z lowers the torch on your machine

@@ -122,7 +122,7 @@ namespace Machine {
         float _threshold_volts   = 2.0f;   // deadband
         float _pid_p             = 10.0f;  // proportional gain (volts -> step rate)
         int   _vad_threshold_pct = 0;      // velocity anti-dive; 0 disables it
-        int   _thc_delay_ms      = 300;    // stabilization delay after arc-ok
+        float _thc_engage_distance_mm = 10.0f;  // path distance after arc-on before THC engages
         float _max_z_rate_mm_min = 600.0f; // caps the injected Z rate
         int   _avg_samples       = 5;      // moving-average window
         bool  _invert_z          = false;  // set if +Z lowers the torch on this machine
@@ -150,7 +150,8 @@ namespace Machine {
         int      _sample_count = 0;
 
         bool     _arc_ok_prev   = false;
-        int64_t  _arc_ok_since_us = 0;  // when arc-ok last rose
+        float    _arc_distance_mm  = 0.0f;  // path length accumulated since arc-on
+        int64_t  _last_service_us  = 0;     // previous service tick, for dt integration
 
         std::atomic<int>   _step_dir { 0 };       // +1 up, -1 down, 0 hold
         std::atomic<float> _step_rate_hz { 0.0f };
