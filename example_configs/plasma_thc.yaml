@@ -60,7 +60,9 @@ thc:
   arc_voltage_scale: 230.0        # divider ratio (raw pin volts -> arc volts)
   arc_voltage_offset: 0.0
   arc_ok_pin: gpio.39:low         # asserted (active-low) when the arc is established
-  min_arc_voltage: 30             # M103 Q at/below this disables correction
+  min_arc_voltage: 30             # dual floor: M103 Q at/below this disables correction, AND
+                                  # measured arc volts below this = no valid arc, so THC holds
+                                  # (guards the end-of-cut runaway when arc-OK lingers past collapse)
   target_voltage: 0               # seeded until a program sends M103 Q
   threshold_volts: 2.0            # deadband around the target
   pid_p: 10.0                     # proportional gain (volts -> step rate)

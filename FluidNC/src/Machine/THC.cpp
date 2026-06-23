@@ -31,9 +31,14 @@ namespace Machine {
         //  - disabled (M102, or never M101'd)
         //  - no arc established
         //  - target at/below the configured minimum (the "THC off" setpoint)
+        //  - measured voltage below the configured minimum: no valid arc to regulate.
+        //    At end-of-cut the arc-OK input typically lingers a few ms after the arc
+        //    voltage has already collapsed toward 0; without this gate `error` would be
+        //    full-scale and the THC would slam Z at max rate off a non-physical reading.
         //  - arc not yet stable (still within the post-pierce delay)
         //  - velocity anti-dive active (feed dropped through a corner)
-        if (!in.enabled || !in.arc_ok || in.target_volts <= in.min_volts || !in.stabilized || in.antidive) {
+        if (!in.enabled || !in.arc_ok || in.target_volts <= in.min_volts || in.avg_volts < in.min_volts ||
+            !in.stabilized || in.antidive) {
             return ThcAction::Hold;
         }
 

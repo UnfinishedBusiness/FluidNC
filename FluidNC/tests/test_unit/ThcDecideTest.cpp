@@ -82,6 +82,17 @@ TEST(ThcDecide, HoldsWhenTargetBelowMin) {
     EXPECT_EQ(decide(in, rate), ThcAction::Hold);
 }
 
+TEST(ThcDecide, HoldsWhenAvgBelowMin) {
+    // Measured voltage has collapsed below the configured minimum (no valid arc),
+    // even though the arc-OK input still lingers. The THC must hold rather than chase
+    // the non-physical reading and slam Z at max rate.
+    ThcInputs in = goodInputs();
+    in.avg_volts = 20.0f;  // below min_volts (30)
+    float rate   = 99.0f;
+    EXPECT_EQ(decide(in, rate), ThcAction::Hold);
+    EXPECT_FLOAT_EQ(rate, 0.0f);
+}
+
 TEST(ThcDecide, HoldsBeforeStabilized) {
     ThcInputs in  = goodInputs();
     in.stabilized = false;
@@ -97,10 +108,12 @@ TEST(ThcDecide, HoldsDuringAntiDive) {
 }
 
 TEST(ThcDecide, RateClampedToMax) {
-    ThcInputs in = goodInputs();
-    in.avg_volts = 0.0f;  // huge error -> 10*120 = 1200 (still < 5000)
-    in.target_volts = 600.0f;  // error 600 -> 6000, clamped to 5000
-    float rate   = 0.0f;
+    // avg stays at/above min_volts (so the no-valid-arc gate doesn't trip) while the
+    // error is still huge: error = 600-30 = 570 -> 10*570 = 5700, clamped to 5000.
+    ThcInputs in    = goodInputs();
+    in.avg_volts    = 30.0f;   // == min_volts; valid arc, just far below target
+    in.target_volts = 600.0f;
+    float rate      = 0.0f;
     EXPECT_EQ(decide(in, rate), ThcAction::Up);
     EXPECT_FLOAT_EQ(rate, kMaxRate);
 }
