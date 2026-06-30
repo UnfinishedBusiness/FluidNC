@@ -14,6 +14,7 @@
 #include "JogIntegrator.h"
 #include "JogStepper.h"
 #include "Homing.h"
+#include "../Stepping.h"  // Stepping::getSteps — real stepped-motion probe for the anti-wedge watchdog
 
 #include <algorithm>
 #include <cstring>
@@ -25,6 +26,17 @@ namespace Machine {
     // runs at ~1 kHz (vTaskDelay(1)); 1 ms is finer than GcodePilot's 2 ms host substep, so a single
     // integration per tick is accurate without sub-stepping.
     static constexpr float JOG_TICK_S = 0.001f;
+
+    // Snapshot the per-axis stepped-position counters (axis_steps[], advanced ONLY by the step ISR
+    // via Stepping::step()) into out[3]. The anti-wedge watchdog compares this snapshot tick-to-tick
+    // to tell whether the machine ACTUALLY stepped — independent of the integrator's internal
+    // velocity. Per-axis (not a sum) so an opposite-direction diagonal jog can't cancel to "no
+    // change". A torn read against the ISR costs at most one tick of detection latency, self-correcting.
+    static inline void snapshotAxisSteps(int32_t out[3]) {
+        for (int a = 0; a < 3; ++a) {
+            out[a] = (a < Axes::_numberAxis) ? int32_t(Stepping::getSteps(axis_t(a))) : 0;
+        }
+    }
 
     void Jogging::group(Configuration::HandlerBase& handler) {
         handler.item("allow_unhomed", _allow_unhomed);
@@ -261,7 +273,8 @@ namespace Machine {
         if (!_integ.primed) {
             JogIntegrator::seed(_integ, gc_state.position);
             JogStepper::enter();
-            _stallTicks = 0;  // fresh entry: arm the anti-wedge watchdog from zero
+            _stallTicks = 0;                  // fresh entry: arm the anti-wedge watchdog from zero
+            snapshotAxisSteps(_lastSteps);    // baseline the stepped-motion probe at the start position
         }
 
         float maxTargetVel = 0.0f;  // largest commanded per-axis target this tick (mm/s), for the watchdog
@@ -308,17 +321,37 @@ namespace Machine {
         float curSpeed = JogIntegrator::speed(_integ);
         _lastRunwayMm  = curSpeed;  // |JogQ current speed (mm/s)
 
-        // Anti-wedge watchdog (Issue 1, belt-and-suspenders). If a held jog is commanding a real
-        // per-axis target (> EPS) yet the integrator produces no motion (< EPS) for JOG_STALL_TICKS
-        // consecutive ticks (~250 ms of the integrator's fixed-tick time, orders of magnitude above
-        // the ~1-tick ramp out of EPS), force teardown to Idle. This makes "in <Jog> with zero
-        // velocity, no motion" impossible by construction even for a never-before-seen trigger:
-        // a positive setpoint that never yields steps cannot persist. A genuinely slow setpoint
-        // (target <= EPS) and the ramp-to-rest (Phase::Stopping) never trip it.
+        // Anti-wedge watchdog (Issue 1). Keyed on REAL stepped motion (axis_steps[]), NOT the
+        // integrator's internal velocity. If a held jog commands a real per-axis target (> EPS) yet
+        // the steppers emit NO actual steps for JOG_STALL_TICKS consecutive ticks (~250 ms), force
+        // teardown to Idle so the machine can NEVER sit in <Jog> with no motion.
+        //
+        // Why steps and not velocity: the integrator advances `_integ.vel` every refill tick in this
+        // ~1 kHz loop REGARDLESS of whether the step ISR is actually firing. When an intermittent
+        // engine-handoff race stops the jog step timer (the pulse_func `return state_is(Jog)` re-arm
+        // dropping on a transient non-Jog, after which nothing re-wakes it), the machine sits in
+        // <Jog> with frozen MPos while the integrator happily ramps `curSpeed` to FULL speed. The old
+        // `curSpeed < EPS` test therefore NEVER tripped (curSpeed was large), so that wedge persisted
+        // for seconds until external recovery — exactly the bug. Probing axis_steps[] catches it: a
+        // dead step ISR self-heals in ~250 ms (a brief stutter; the held jog must be re-pressed), and
+        // the log_warn makes the residual upstream trigger diagnosable. It also still covers the
+        // original case (commanded into a soft-limit fence it's parked on → no steps possible → tear
+        // down). The Phase::Stopping ramp-to-rest is excluded (it legitimately reaches zero steps).
+        // Note: real jog feeds emit many steps per 250 ms, so a live jog can't false-trip; only a
+        // genuinely sub-step-rate setpoint could, and that benignly drops to Idle (re-press resumes).
+        int32_t steps[3];
+        snapshotAxisSteps(steps);
+        bool anyStep = false;
+        for (int a = 0; a < 3; ++a) {
+            if (steps[a] != _lastSteps[a]) {
+                anyStep = true;
+            }
+            _lastSteps[a] = steps[a];
+        }
         constexpr int JOG_STALL_TICKS = 250;
-        if (_phase == Phase::Jogging && maxTargetVel > JogIntegrator::EPS_V_MM_S && curSpeed < JogIntegrator::EPS_V_MM_S) {
+        if (_phase == Phase::Jogging && maxTargetVel > JogIntegrator::EPS_V_MM_S && !anyStep) {
             if (++_stallTicks > JOG_STALL_TICKS) {
-                log_warn("jog stall watchdog: forced idle");
+                log_warn("jog stall watchdog: no stepped motion — forcing idle");
                 set_state(State::Idle);  // onMotionTerminated does the Alarm:Unhomed round-trip if needed
                 onMotionTerminated();
                 return;

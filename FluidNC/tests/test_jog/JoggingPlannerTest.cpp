@@ -169,15 +169,29 @@ system_t sys;
 // maxCruiseMmMin is gone — the DDA step ceiling is now a per-axis clamp inside Jogging.
 float jogVelMaxMmS  = 0.0f;
 float jogVelPeak[3] = { 0.0f, 0.0f, 0.0f };  // per-axis peak |published velocity| (mm/s)
+// Simulate a DEAD step ISR: when true, the mock publishes velocity but emits NO steps (axis_steps[]
+// stays frozen) — the exact wedge the anti-wedge watchdog must catch. Default false: a moving axis
+// advances axis_steps each tick, mirroring the real DDA, so a healthy jog never trips the watchdog.
+bool fakeIsrDead = false;
 namespace Machine {
     volatile bool    JogStepper::_active          = false;
     volatile int32_t JogStepper::_inc[MAX_N_AXIS] = { 0 };
     int32_t          JogStepper::_acc[MAX_N_AXIS] = { 0 };
 
+    // axis_steps[] is the machine-position truth, advanced by the real step ISR (Stepping::step) and
+    // read by Jogging's anti-wedge watchdog via Stepping::getSteps(). Stepping.cpp isn't compiled into
+    // this test, so define the static member here (getSteps is inline in Stepping.h).
+    steps_t Stepping::axis_steps[MAX_N_AXIS] = { 0 };
+
     void JogStepper::isr_compute(AxisMask&, AxisMask&) {}
     void JogStepper::setVelocity(const float v[3]) {
         for (int a = 0; a < 3; ++a) {
             jogVelPeak[a] = std::max(jogVelPeak[a], std::fabs(v[a]));
+            // Model the DDA: a commanded axis emits ~one step per tick at the published rate, advancing
+            // axis_steps in the travel direction (unless we're simulating a dead ISR).
+            if (!fakeIsrDead && std::fabs(v[a]) > 1e-6f) {
+                Stepping::setSteps(axis_t(a), Stepping::getSteps(axis_t(a)) + (v[a] > 0.0f ? 1 : -1));
+            }
         }
         jogVelMaxMmS = std::max({ jogVelPeak[0], jogVelPeak[1], jogVelPeak[2] });
     }
@@ -210,6 +224,8 @@ namespace {
             flushCount         = 0;
             jogVelMaxMmS       = 0.0f;
             jogVelPeak[0] = jogVelPeak[1] = jogVelPeak[2] = 0.0f;
+            fakeIsrDead        = false;   // healthy step ISR unless a test opts into the wedge
+            for (int a = 0; a < MAX_N_AXIS; ++a) Machine::Stepping::setSteps(axis_t(a), 0);
             Machine::JogStepper::exit();  // ensure not active between tests
             lastAlarm          = ExecAlarm::None;
             testState          = State::Idle;
@@ -498,6 +514,32 @@ namespace {
         EXPECT_FALSE(jogging.active());
         EXPECT_FALSE(Machine::JogStepper::active());
         EXPECT_EQ(testState, State::Idle);
+    }
+
+    // The regression for the field bug: a DEAD step ISR. The integrator ramps its velocity to full
+    // speed (curSpeed well above EPS) but the steppers emit NO steps (axis_steps[] frozen) — the
+    // machine sat in <Jog> with frozen MPos for ~8 s in the field. A velocity-keyed watchdog was
+    // blind to this (curSpeed was large); the step-keyed watchdog must force teardown to Idle.
+    TEST_F(JoggingPlannerTest, StallWatchdogForcesIdleWhenStepIsrIsDead) {
+        fakeIsrDead = true;             // velocity is published every tick, but NO steps are emitted
+        establishJog(12000.0f);        // a fast jog: the integrator ramps curSpeed far above EPS
+        pumpRefills(50);
+        ASSERT_TRUE(jogging.active());  // still ramping; watchdog hasn't reached its threshold yet
+        ASSERT_GT(jogVelMaxMmS, 1.0f);  // the integrator genuinely "thinks" it is moving (velocity-blind watchdog would never fire)
+        pumpRefills(400);               // past the ~250-tick stall threshold with zero stepped motion
+        EXPECT_FALSE(jogging.active());
+        EXPECT_FALSE(Machine::JogStepper::active());
+        EXPECT_EQ(testState, State::Idle);
+    }
+
+    // The complement: a HEALTHY jog (steps advancing each tick) must NEVER trip the watchdog, no
+    // matter how long it is held.
+    TEST_F(JoggingPlannerTest, StallWatchdogNeverTripsWhileStepping) {
+        establishJog(6000.0f);          // fakeIsrDead=false → the mock advances axis_steps each tick
+        pumpRefills(2000);              // 8x the stall threshold
+        EXPECT_TRUE(jogging.active());
+        EXPECT_TRUE(Machine::JogStepper::active());
+        EXPECT_EQ(testState, State::Jog);
     }
 }
 

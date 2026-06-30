@@ -62,11 +62,15 @@ namespace Machine {
         bool   _entryUnhomed     = false;        // started from Alarm:Unhomed -> return there on stop
 
         // Anti-wedge watchdog: consecutive refill ticks where the jog is held with a real per-axis
-        // target commanded but the integrator is producing no motion. Counted in the integrator's own
-        // fixed-tick time (JOG_TICK_S), reset on entry and whenever motion is seen; if it ever exceeds
+        // target commanded AND the integrator's velocity has ramped up, yet the steppers emit NO
+        // actual steps (axis_steps[] frozen). Counted in the integrator's own fixed-tick time
+        // (JOG_TICK_S), reset on entry and whenever real stepped motion is seen; if it ever exceeds
         // JOG_STALL_TICKS the engine force-tears-down to Idle so the machine can NEVER sit in <Jog>
-        // with zero velocity (Issue 1, made impossible by construction). See refillVectorDirect.
-        int _stallTicks = 0;
+        // with no motion (Issue 1). Keyed on REAL steps, not integrator velocity — see
+        // refillVectorDirect for why a velocity-keyed watchdog was blind to a dead step ISR.
+        int     _stallTicks    = 0;
+        int32_t _lastSteps[3]  = { 0, 0, 0 };  // axis_steps[] at the previous tick — per-axis so an
+                                               // opposite-direction diagonal can't cancel in a sum
 
         // Velocity-setpoint trajectory (LinuxCNC-style ramp/blend; see JogIntegrator.h). Carried
         // across direction/feed changes (the integrator blends); reset on every teardown.
