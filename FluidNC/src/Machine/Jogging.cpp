@@ -271,6 +271,14 @@ namespace Machine {
         // alarm, a suspend/feed-hold, a soft reset, or any state we don't own — drops everything.
         // During our own ramp-down the state is still Jog with no suspend bit, so this stays passive.
         if (JogStepper::active() && (sys_motion_ending() || !state_is(State::Jog))) {
+            // GUARANTEED RECOVERY: if we tear down while STILL in Jog (a lingering suspend bit tripped
+            // sys_motion_ending() rather than a real external state change), drive state to Idle so we
+            // can never strand the machine in a frozen <Jog>. When an external alarm/idle already moved
+            // us out of Jog, leave that state untouched. Mirrors the wedge/stall watchdog paths below,
+            // which both set_state(Idle) before onMotionTerminated().
+            if (state_is(State::Jog)) {
+                set_state(State::Idle);
+            }
             onMotionTerminated();  // JogStepper::exit() (stop timer + resync) + teardown
             return;
         }
@@ -286,6 +294,20 @@ namespace Machine {
         if (!_integ.primed) {
             JogIntegrator::seed(_integ, gc_state.position);
             JogStepper::enter();
+            // CURE for the intermittent "<Jog> with no motion, clears after seconds" freeze: a fresh jog
+            // can inherit a STALE termination suspend bit (jogCancel/motionCancel) left by a prior
+            // direct-stepper jog or a canceled motion. sys_motion_ending() (== any suspend bit set) then
+            // reads true on the NEXT tick, and the external-termination guard below tears this brand-new
+            // jog straight back down to Phase::Idle — but with state still Jog, so refillVectorDirect
+            // never runs again and the machine sits frozen in <Jog> until a new $Jog/Start re-primes it.
+            // We just validated a clean Idle/Jog start (startVector's state gate), so nothing legitimate
+            // is terminating — clear the stale bits now. Mirrors onMotionTerminated's teardown recipe.
+            {
+                auto s             = sys.suspend();
+                s.bit.motionCancel = false;
+                s.bit.jogCancel    = false;
+                sys.set_suspend(s);
+            }
             _stallTicks = 0;                  // fresh entry: arm the anti-wedge watchdog from zero
             snapshotAxisSteps(_lastSteps);    // baseline the stepped-motion probe at the start position
         }
