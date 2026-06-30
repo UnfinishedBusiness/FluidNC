@@ -231,7 +231,10 @@ bool IRAM_ATTR Stepper::pulse_func() {
         // that would clear _active → self-sustaining, and it strangles the comms task (total RX/status
         // silence — the bench "lost jogging"). Stopping the timer here breaks the loop: the main loop
         // regains CPU and refill() tears the jog down cleanly on its next tick. (Preserves d47af2fb.)
-        return state_is(State::Jog);
+        // Stop re-arming when the ISR wedge-breaker has tripped (a jog firing with no steps for too
+        // long — a storm or a <Jog> stuck at zero velocity). Returning false halts the timer, which
+        // frees the CPU so the main loop's refillVectorDirect() can see wedgeAbort() and tear down.
+        return state_is(State::Jog) && !Machine::JogStepper::wedgeAbort();
     }
 #endif
 

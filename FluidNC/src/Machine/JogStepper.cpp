@@ -22,6 +22,8 @@ namespace Machine {
     // Start at the floor period so the very first ISR tick (which fires before refill's first
     // setVelocity publishes a real rate) idles at JOG_MIN_STEP_HZ rather than storming.
     volatile uint32_t JogStepper::_isrPeriod       = Stepping::fStepperTimer / JOG_MIN_STEP_HZ;
+    volatile bool     JogStepper::_wedgeAbort      = false;
+    uint32_t          JogStepper::_zeroStepTicks   = 0;
 
     void JogStepper::setVelocity(const float vel_mm_s[3]) {
         // Publish the speed (mm/min) for the |FS: status field.
@@ -90,6 +92,18 @@ namespace Machine {
         }
         step_out = steps;
         dir_out  = dirs;
+
+        // ISR-resident anti-wedge breaker: a healthy jog emits steps continuously. If we fire
+        // JOG_WEDGE_ISR_TICKS times in a row with NO step (a storm, or <Jog> stuck at zero commanded
+        // velocity), trip the abort — pulse_func then stops re-arming the timer, which frees the CPU
+        // so the main loop can tear the jog down. Cleared on a real step and on enter().
+        if (steps == 0) {
+            if (_zeroStepTicks < JOG_WEDGE_ISR_TICKS && ++_zeroStepTicks >= JOG_WEDGE_ISR_TICKS) {
+                _wedgeAbort = true;
+            }
+        } else {
+            _zeroStepTicks = 0;
+        }
     }
 
     void JogStepper::enter() {
@@ -100,6 +114,8 @@ namespace Machine {
             _acc[a] = 0;
             _inc[a] = 0;
         }
+        _zeroStepTicks = 0;      // fresh jog: arm the ISR wedge-breaker from zero
+        _wedgeAbort    = false;
         // Idle at the floor period until refill's first setVelocity publishes a real rate, so the
         // first tick after wake_up doesn't fire at the previous jog's stale (fast) period.
         _isrPeriod = Stepping::fStepperTimer / JOG_MIN_STEP_HZ;

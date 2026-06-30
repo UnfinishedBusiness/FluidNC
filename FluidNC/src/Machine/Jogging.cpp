@@ -254,6 +254,19 @@ namespace Machine {
     }
 
     void Jogging::refillVectorDirect() {
+        // ISR wedge-breaker tripped: the step ISR detected a jog firing with no motion for too long
+        // (a storm, or <Jog> stuck at zero commanded velocity — the elusive intermittent freeze) and
+        // halted its own timer to free the CPU. Tear the jog down to Idle now that we can run again.
+        // This is the starvation-proof backstop: it works even when the wedge starved this very loop,
+        // because the ISR — not this loop — is what broke it. log_warn so any recurrence is captured.
+        if (JogStepper::wedgeAbort()) {
+            log_warn("jog wedge breaker: ISR forced recovery (in <Jog> with no stepped motion)");
+            JogStepper::clearWedgeAbort();
+            set_state(State::Idle);  // onMotionTerminated does the Alarm:Unhomed round-trip if needed
+            onMotionTerminated();
+            return;
+        }
+
         // Safety net: once the jog is live (enter() set State::Jog), any external termination — an
         // alarm, a suspend/feed-hold, a soft reset, or any state we don't own — drops everything.
         // During our own ramp-down the state is still Jog with no suspend bit, so this stays passive.

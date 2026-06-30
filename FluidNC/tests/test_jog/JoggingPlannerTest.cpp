@@ -177,6 +177,8 @@ namespace Machine {
     volatile bool    JogStepper::_active          = false;
     volatile int32_t JogStepper::_inc[MAX_N_AXIS] = { 0 };
     int32_t          JogStepper::_acc[MAX_N_AXIS] = { 0 };
+    volatile bool    JogStepper::_wedgeAbort      = false;  // ISR breaker flag (real def is in JogStepper.cpp)
+    uint32_t         JogStepper::_zeroStepTicks   = 0;
 
     // axis_steps[] is the machine-position truth, advanced by the real step ISR (Stepping::step) and
     // read by Jogging's anti-wedge watchdog via Stepping::getSteps(). Stepping.cpp isn't compiled into
@@ -185,18 +187,30 @@ namespace Machine {
 
     void JogStepper::isr_compute(AxisMask&, AxisMask&) {}
     void JogStepper::setVelocity(const float v[3]) {
+        bool stepped = false;
         for (int a = 0; a < 3; ++a) {
             jogVelPeak[a] = std::max(jogVelPeak[a], std::fabs(v[a]));
             // Model the DDA: a commanded axis emits ~one step per tick at the published rate, advancing
             // axis_steps in the travel direction (unless we're simulating a dead ISR).
             if (!fakeIsrDead && std::fabs(v[a]) > 1e-6f) {
                 Stepping::setSteps(axis_t(a), Stepping::getSteps(axis_t(a)) + (v[a] > 0.0f ? 1 : -1));
+                stepped = true;
             }
         }
         jogVelMaxMmS = std::max({ jogVelPeak[0], jogVelPeak[1], jogVelPeak[2] });
+        // Model the ISR-resident wedge-breaker (the real counter lives in JogStepper::isr_compute, an
+        // ISR not driven by these host tests). One refill tick stands in for the ISR tick: if no step
+        // is emitted for JOG_WEDGE_ISR_TICKS consecutive ticks, trip the abort the main loop reads.
+        if (stepped) {
+            _zeroStepTicks = 0;
+        } else if (_zeroStepTicks < JOG_WEDGE_ISR_TICKS && ++_zeroStepTicks >= JOG_WEDGE_ISR_TICKS) {
+            _wedgeAbort = true;
+        }
     }
     void JogStepper::enter() {
-        _active = true;
+        _active        = true;
+        _zeroStepTicks = 0;      // mirror the real enter(): arm the wedge-breaker from zero
+        _wedgeAbort    = false;
         set_state(State::Jog);
     }
     void JogStepper::exit() { _active = false; }
@@ -225,6 +239,7 @@ namespace {
             jogVelMaxMmS       = 0.0f;
             jogVelPeak[0] = jogVelPeak[1] = jogVelPeak[2] = 0.0f;
             fakeIsrDead        = false;   // healthy step ISR unless a test opts into the wedge
+            Machine::JogStepper::clearWedgeAbort();
             for (int a = 0; a < MAX_N_AXIS; ++a) Machine::Stepping::setSteps(axis_t(a), 0);
             Machine::JogStepper::exit();  // ensure not active between tests
             lastAlarm          = ExecAlarm::None;
@@ -539,6 +554,29 @@ namespace {
         pumpRefills(2000);              // 8x the stall threshold
         EXPECT_TRUE(jogging.active());
         EXPECT_TRUE(Machine::JogStepper::active());
+        EXPECT_EQ(testState, State::Jog);
+    }
+
+    // ---- ISR-resident wedge-breaker (starvation-proof backstop) ----
+
+    // A jog firing with NO stepped motion (here: a dead step ISR) must be caught even though the
+    // commanded velocity ramps up — the step ISR raises wedgeAbort and the main loop tears down to
+    // Idle. This is the case the velocity/step watchdogs alone could miss when the loop is starved.
+    TEST_F(JoggingPlannerTest, WedgeBreakerForcesIdleWhenNoSteps) {
+        fakeIsrDead = true;             // velocity is published every tick, but NO steps ever emit
+        establishJog(12000.0f);
+        pumpRefills(int(Machine::JogStepper::JOG_WEDGE_ISR_TICKS) + 50);
+        EXPECT_FALSE(jogging.active());
+        EXPECT_FALSE(Machine::JogStepper::active());
+        EXPECT_EQ(testState, State::Idle);
+    }
+
+    // The breaker must NOT trip a healthy jog (steps emitted every tick) no matter how long it runs.
+    TEST_F(JoggingPlannerTest, WedgeBreakerNeverTripsWhileStepping) {
+        establishJog(6000.0f);
+        pumpRefills(int(Machine::JogStepper::JOG_WEDGE_ISR_TICKS) * 4);
+        EXPECT_TRUE(jogging.active());
+        EXPECT_FALSE(Machine::JogStepper::wedgeAbort());
         EXPECT_EQ(testState, State::Jog);
     }
 }

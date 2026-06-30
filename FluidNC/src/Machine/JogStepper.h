@@ -40,6 +40,20 @@ namespace Machine {
 
         static bool active() { return _active; }
 
+        // ── ISR-resident anti-wedge breaker (starvation-proof) ────────────────────────────────────
+        // The step ISR runs at LEVEL3 and keeps firing even when a runaway/CPU-storm starves every
+        // FreeRTOS task — including the main loop where Jogging::refill()'s watchdog lives. So the
+        // last-resort recovery has to live HERE, in the ISR itself. isr_compute() counts consecutive
+        // jog ISR ticks that emit ZERO steps; a healthy jog emits steps continuously (resetting it),
+        // so only a wedge (storm, or <Jog> stuck at zero commanded velocity) lets it climb. At the
+        // threshold the ISR raises _wedgeAbort and pulse_func stops re-arming the timer (returns
+        // false) — which breaks the storm and frees the CPU. The now-running main loop sees
+        // wedgeAbort() in refillVectorDirect and tears the jog down to Idle. Bounds any freeze to
+        // ~JOG_WEDGE_ISR_TICKS at the 1 kHz floor (≈300 ms), and far less under an actual storm.
+        static constexpr uint32_t JOG_WEDGE_ISR_TICKS = 300;
+        static bool wedgeAbort() { return _wedgeAbort; }
+        static void clearWedgeAbort() { _wedgeAbort = false; }
+
         // Timer ticks per step-ISR tick (Machine::Stepping::fStepperTimer / f_tick), published by
         // setVelocity and programmed by the jog branch of Stepper::pulse_func every tick. IRAM-safe
         // (plain volatile load; inlined, no flash call).
@@ -74,5 +88,7 @@ namespace Machine {
         static int32_t           _acc[MAX_N_AXIS];   // ISR-private fractional-step accumulator (Q16)
         static volatile float    _rateMmMin;         // |velocity| (mm/min) for the |FS: status field
         static volatile uint32_t _isrPeriod;         // timer ticks/ISR tick — tracks the live step rate
+        static volatile bool     _wedgeAbort;        // ISR breaker tripped: main loop must tear down to Idle
+        static uint32_t          _zeroStepTicks;     // consecutive jog ISR ticks that emitted no step (ISR-private)
     };
 }
