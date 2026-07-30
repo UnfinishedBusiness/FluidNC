@@ -31,6 +31,9 @@ static uint32_t init_step_pin(pinnum_t step_pin, bool step_invert) {
 }
 
 static int32_t        _stepPulseEndTime;
+// Mirrors esp32/timed_engine.c: spin on _stepPulseEndTime only while a pulse is in flight,
+// never on a stale deadline from a previous motion (the wrapping cycle-counter wedge).
+static bool           _pulsePending;
 static void IRAM_ATTR set_pin(pinnum_t pin, bool level) {
     gpio_write(pin, level);
 }
@@ -47,10 +50,14 @@ static void IRAM_ATTR start_step() {}
 // will happen in start_unstep()
 static void IRAM_ATTR finish_step() {
     _stepPulseEndTime = usToEndTicks(_pulse_delay_us);
+    _pulsePending     = true;
 }
 
 static bool IRAM_ATTR start_unstep() {
-    spinUntil(_stepPulseEndTime);
+    if (_pulsePending) {
+        _pulsePending = false;
+        spinUntil(_stepPulseEndTime);
+    }
     return false;
 }
 

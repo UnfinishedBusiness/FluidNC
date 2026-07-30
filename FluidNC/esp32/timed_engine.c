@@ -26,6 +26,15 @@ static uint32_t init_step_pin(pinnum_t step_pin, bool step_invert) {
 
 static int _stepPulseEndTime;
 
+// True only between finish_step() and the next start_unstep() — i.e. while a step pulse is
+// actually in flight. start_unstep() must not spin on _stepPulseEndTime otherwise: the deadline
+// comes from the wrapping 32-bit CPU cycle counter (period ~18 s at 240 MHz), so a stale value
+// from the last pulse of a previous motion puts spinUntil() up to 2^31 cycles (~9 s) in the
+// future about half the time. Stepper::stop_stepping() calls unstep without a preceding step —
+// on the first jog/cycle after an idle gap that stale spin wedged the main task for seconds
+// (the long-standing "<Jog>/RUNNING with no motion" freeze).
+static bool _pulsePending;
+
 static void IRAM_ATTR set_pin(pinnum_t pin, bool level) {
     gpio_write(pin, level);
 }
@@ -42,10 +51,14 @@ static void IRAM_ATTR start_step() {}
 // will happen in start_unstep()
 static void IRAM_ATTR finish_step() {
     _stepPulseEndTime = usToEndTicks(_pulse_delay_us);
+    _pulsePending     = true;
 }
 
 static bool IRAM_ATTR start_unstep() {
-    spinUntil(_stepPulseEndTime);
+    if (_pulsePending) {
+        _pulsePending = false;
+        spinUntil(_stepPulseEndTime);
+    }
     return false;
 }
 
