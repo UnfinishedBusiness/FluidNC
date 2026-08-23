@@ -25,6 +25,30 @@ TEST(JogCapabilities, ReportsExactContractLine) {
     EXPECT_EQ(out.line, "[CAP:FWJOG=1]");
 }
 
+TEST(JogCapabilities, AppendsSanitizedBuildIdentity) {
+    struct CapturingChannel {
+        MsgLevel    level = MsgLevelVerbose;
+        std::string line;
+
+        void sendLine(MsgLevel l, const char* s) {
+            level = l;
+            line  = s;
+        }
+    };
+
+    // VER= carries git_info so the host can compare the RUNNING firmware against its bundled images.
+    // Spaces/brackets/commas are stripped — they would break the sender's k=v token parsing.
+    CapturingChannel out;
+    Machine::reportFwJogCapabilities(out, "v4.x.x (Firmware4.x-330cad03)");
+    EXPECT_EQ(out.level, MsgLevelNone);
+    EXPECT_EQ(out.line, "[CAP:FWJOG=1,VER=v4.x.x(Firmware4.x-330cad03)]");
+
+    // Null/empty build info keeps the exact legacy contract line.
+    CapturingChannel legacy;
+    Machine::reportFwJogCapabilities(legacy, "");
+    EXPECT_EQ(legacy.line, "[CAP:FWJOG=1]");
+}
+
 TEST(JogVector, ParsesFullVector) {
     Vector v;
     ASSERT_TRUE(parse_vector("X1 Y0 Z-1 F1000", v));

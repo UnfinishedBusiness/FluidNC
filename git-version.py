@@ -23,12 +23,11 @@ else:
     except:
         tag = "v4.x.x"
 
-    # Check to see if the head commit exactly matches a tag.
-    # If so, the revision is "release", otherwise it is BRANCH-COMMIT
-    try:
-        subprocess.check_call(["git", "describe", "--tags", "--exact"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        rev = ''
-    except:
+    # JC3 fork: ALWAYS carry the BRANCH-COMMIT revision, even on an exact tag. git_info is the
+    # firmware's build identity (welcome banner + the $Cap VER token), and the host's firmware-update
+    # badge matches the bundle manifest's gitCommit against it as a substring — a tag-only identity
+    # would have no hash and read as permanently stale.
+    if True:
         branchname = (
             subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"])
             .strip()

@@ -189,8 +189,8 @@ void report_init_message(Channel& channel) {
 
 #ifdef ENABLE_FW_JOG
     // Advertise the firmware-native vector-jog engine on the boot banner too, so a sender can
-    // feature-detect without issuing $I.
-    Machine::reportFwJogCapabilities(channel);
+    // feature-detect without issuing $I. git_info rides along as VER= (build identity).
+    Machine::reportFwJogCapabilities(channel, git_info);
 #endif
 }
 
@@ -413,8 +413,8 @@ void report_build_info(const char* line, Channel& channel) {
 
 #ifdef ENABLE_FW_JOG
     // Firmware-native vector-jog capability advertisement. Lets a sender feature-detect the
-    // $Jog/* engine instead of probing.
-    Machine::reportFwJogCapabilities(channel);
+    // $Jog/* engine instead of probing. git_info rides along as VER= (build identity).
+    Machine::reportFwJogCapabilities(channel, git_info);
 #endif
 }
 

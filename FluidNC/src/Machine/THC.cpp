@@ -163,6 +163,15 @@ namespace Machine {
         }
 #endif
 
+        // Peak latch: max INSTANTANEOUS scaled voltage since the last resetPeak() (GCode calls it on
+        // every user digital output ON — the torch fire). Deliberately the raw sample, NOT the moving
+        // average below: a peck-mark transfer blip lasts only a few ms and averaging would pull it
+        // under the host's verify threshold. Single writer (this 1 kHz loop); the GCode-context reset
+        // can at worst race one sample, which is the idle floor at that instant — harmless.
+        if (v > _peak_volts.load()) {
+            _peak_volts.store(v);
+        }
+
         // moving average
         _samples[_sample_idx] = v;
         _sample_idx           = (_sample_idx + 1) % _avg_samples;
@@ -267,18 +276,20 @@ namespace Machine {
 
     // ------------------------------- reporting -------------------------------
 
-    // |Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>,<ovrMode>
+    // |Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>,<ovrMode>,<peak>
     //   voltage  = measured arc volts; arc_ok = arc-OK input; active = currently correcting Z;
     //   target   = effective target volts (override volts when overriding, else M103 Q);
     //   enabled  = effective armed (0 when override mode is Disabled, else M101=1 / M102=0);
-    //   ovrMode  = GcodePilot override mode (0 Gcode, 1 Override, 2 Disabled).
+    //   ovrMode  = GcodePilot override mode (0 Gcode, 1 Override, 2 Disabled);
+    //   peak     = max instantaneous volts since the last M62/M64 (peck-verify latch).
     // target/enabled carry the *effective* values so the GcodePilot DRO follows naturally.
+    // Fields are ADDITIVE ONLY — old hosts parse a prefix and ignore the rest.
     void THC::status_report(LogStream& msg) {
         ThcResolved eff =
             thcResolve((ThcOvrMode)_ovr_mode.load(), _target_volts.load(), _ovr_volts.load(), _enabled.load());
         msg << "|Arc:" << setprecision(1) << _arc_volts.load() << "," << (_arc_ok.load() ? 1 : 0) << ","
             << (_active.load() ? 1 : 0) << "," << setprecision(1) << eff.target_volts << "," << (eff.armed ? 1 : 0)
-            << "," << _ovr_mode.load();
+            << "," << _ovr_mode.load() << "," << setprecision(1) << _peak_volts.load();
     }
 
 #ifdef __FLUIDNC

@@ -1790,6 +1790,12 @@ Error gc_execute_line(const char* input_line) {
                 protocol_buffer_synchronize();
             }
             bool turnOn = gc_block.modal.io_control == IoControl::DigitalOnSync || gc_block.modal.io_control == IoControl::DigitalOnImmediate;
+            if (turnOn && config->_thc) {
+                // Fresh peak-voltage window from this output-ON (the torch fire on plasma machines) —
+                // the peck-verify latch the host reads as the 7th Arc: field. Any-output reset is safe:
+                // the verify read happens inside the same fire block, with no other output writes between.
+                config->_thc->resetPeak();
+            }
             if (!config->_userOutputs->setDigital((int)gc_block.values.p, turnOn)) {
                 return Error::PParamMaxExceeded;
             }

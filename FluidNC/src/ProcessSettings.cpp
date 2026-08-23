@@ -1033,7 +1033,7 @@ static Error fwCapReport(const char* value, AuthenticationLevel, Channel& out) {
     // On-demand capability line. The boot banner is missed when the sender opens the port after
     // boot, and $I is Idle-gated host-side (a must_home board sits in Alarm:Unhomed) — so a sender
     // queries $Cap right at connect, in ANY state, and feature-detects deterministically.
-    Machine::reportFwJogCapabilities(out);
+    Machine::reportFwJogCapabilities(out, git_info);
     return Error::Ok;
 }
 #endif

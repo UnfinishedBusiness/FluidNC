@@ -81,6 +81,15 @@ namespace Machine {
         float arcVoltage() const { return _arc_volts.load(); }
         bool  active() const { return _active.load(); }
 
+        // ---- Peak-voltage latch (peck-mark misfire verification) ----
+        // Max INSTANTANEOUS scaled arc voltage seen by the 1 kHz service loop since the last
+        // reset. GCode resets it on every user digital output ON (M62/M64 — the torch fire),
+        // so after a peck pulse the host can read whether the arc ever lit: a transfer blips
+        // the voltage for only a few ms, far shorter than the host's status poll, but the
+        // latch catches it at the sample rate. Reported as the 7th `Arc:` status field.
+        float peakVoltage() const { return _peak_volts.load(); }
+        void  resetPeak() { _peak_volts.store(0.0f); }
+
         // ---- Override API (driven by GcodePilot real-time commands) ----
         // The currently-effective target (override volts when overriding, else the M103 value).
         float effectiveTarget() const {
@@ -134,6 +143,7 @@ namespace Machine {
         std::atomic<float> _arc_volts { 0.0f };
         std::atomic<bool>  _arc_ok { false };
         std::atomic<bool>  _active { false };
+        std::atomic<float> _peak_volts { 0.0f };  // max instantaneous volts since resetPeak()
 
         // ---- Override state (set from GcodePilot real-time commands) ----
         std::atomic<int>   _ovr_mode { (int)ThcOvrMode::Gcode };
