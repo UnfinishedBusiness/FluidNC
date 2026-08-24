@@ -52,6 +52,14 @@ namespace Machine {
     // G-code state. Pure (unit-tested on the native build).
     ThcResolved thcResolve(ThcOvrMode mode, float m103_target, float ovr_volts, bool m101_enabled);
 
+    // ---- M104 peck-pulse wait decision (pure; unit-tested on the native build) ----
+    // One evaluation of the "waiting for the arc to strike" loop: Crossed wins over
+    // TimedOut when both are true on the same tick (the arc DID light — a peck that
+    // reports misfire while the torch flashed would send the retry loop over a live
+    // arc, which is exactly the blown-hole failure M104 exists to prevent).
+    enum class PeckWait { Waiting = 0, Crossed, TimedOut };
+    PeckWait peckWaitState(float peak_volts, float threshold_volts, uint32_t elapsed_ms, uint32_t timeout_ms);
+
     // ---------------------------- The THC feature ----------------------------
 
     // Torch Height Control.  When a `thc:` section is present in the machine config
@@ -89,6 +97,19 @@ namespace Machine {
         // latch catches it at the sample rate. Reported as the 7th `Arc:` status field.
         float peakVoltage() const { return _peak_volts.load(); }
         void  resetPeak() { _peak_volts.store(0.0f); }
+
+        // ---- M104 peck-pulse result (firmware-timed arc-referenced peck) ----
+        // result: -1 = no peck yet this boot, 0 = misfire (no crossing before the
+        // timeout), 1 = fired. latency_ms: relay-on -> voltage-crossing time for the
+        // last peck (elapsed timeout on a misfire). Reported as Arc: status fields
+        // 8 and 9 so the host's #<_peck_result>/#<_peck_latency_ms> live globals can
+        // read them; -1 stays reserved as the host's "unavailable" sentinel.
+        int  peckResult() const { return _last_peck_result.load(); }
+        int  peckLatencyMs() const { return _last_peck_latency_ms.load(); }
+        void setPeckResult(int result, int latency_ms) {
+            _last_peck_result.store(result);
+            _last_peck_latency_ms.store(latency_ms);
+        }
 
         // ---- Override API (driven by GcodePilot real-time commands) ----
         // The currently-effective target (override volts when overriding, else the M103 value).
@@ -144,6 +165,8 @@ namespace Machine {
         std::atomic<bool>  _arc_ok { false };
         std::atomic<bool>  _active { false };
         std::atomic<float> _peak_volts { 0.0f };  // max instantaneous volts since resetPeak()
+        std::atomic<int>   _last_peck_result { -1 };      // M104: -1 none yet, 0 misfire, 1 fired
+        std::atomic<int>   _last_peck_latency_ms { -1 };  // M104: relay-on -> crossing, ms
 
         // ---- Override state (set from GcodePilot real-time commands) ----
         std::atomic<int>   _ovr_mode { (int)ThcOvrMode::Gcode };

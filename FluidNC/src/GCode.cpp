@@ -153,6 +153,7 @@ static void gcode_comment_msg(const char* comment) {
 
 static std::optional<WaitOnInputMode> validate_wait_on_input_mode_value(objnum_t);
 static Error                          gc_wait_on_input(bool is_digital, objnum_t input_number, WaitOnInputMode mode, float timeout);
+static Error                          gc_peck_pulse(int output_num, float hold_s, float threshold_volts, float max_wait_s);
 
 // Edit GCode line in-place, removing whitespace and comments and
 // converting to uppercase
@@ -754,6 +755,10 @@ Error gc_execute_line(const char* input_line) {
                         gc_block.modal.thc = ThcControl::SetVoltage;
                         mg_word_bit        = ModalGroup::MM10;
                         break;
+                    case 104:  // Arc-referenced peck pulse: M104 P<output> Q<hold_s> R<volts> D<max_wait_s>
+                        gc_block.modal.thc = ThcControl::PeckPulse;
+                        mg_word_bit        = ModalGroup::MM10;
+                        break;
                     default:
                         return Error::GcodeUnsupportedCommand;  // [Unsupported M command]
                 }
@@ -1134,6 +1139,24 @@ Error gc_execute_line(const char* input_line) {
             return Error::GcodeValueWordMissing;
         }
         clear_bitnum(value_words, GCodeWord::Q);
+    }
+
+    // M104 P<output> Q<hold_s> R<threshold_volts> D<max_wait_s> — all four words required.
+    // R would be a volts threshold of 0 only by mistake (any floating ADC crosses it instantly)
+    // and D=0 could never see a crossing, so both must be positive. Q=0 is legal: fire, verify
+    // the crossing, and turn straight off ("shortest possible peck").
+    if (gc_block.modal.thc == ThcControl::PeckPulse) {
+        if (bitnum_is_false(value_words, GCodeWord::P) || bitnum_is_false(value_words, GCodeWord::Q) ||
+            bitnum_is_false(value_words, GCodeWord::R) || bitnum_is_false(value_words, GCodeWord::D)) {
+            return Error::GcodeValueWordMissing;
+        }
+        if (gc_block.values.q < 0.0f || gc_block.values.r <= 0.0f || gc_block.values.d <= 0.0f) {
+            return Error::GcodeValueWordInvalid;
+        }
+        clear_bitnum(value_words, GCodeWord::P);
+        clear_bitnum(value_words, GCodeWord::Q);
+        clear_bitnum(value_words, GCodeWord::R);
+        clear_bitnum(value_words, GCodeWord::D);
     }
 
     // [11. Set active plane ]: N/A
@@ -1876,6 +1899,13 @@ Error gc_execute_line(const char* input_line) {
             case ThcControl::SetVoltage:
                 config->_thc->setTargetVoltage(gc_block.values.q);
                 break;
+            case ThcControl::PeckPulse: {
+                Error peckErr = gc_peck_pulse((int)gc_block.values.p, gc_block.values.q, gc_block.values.r, gc_block.values.d);
+                if (peckErr != Error::Ok) {
+                    return peckErr;
+                }
+                break;
+            }
             case ThcControl::None:
                 break;
         }
@@ -2165,4 +2195,68 @@ static Error gc_wait_on_input(bool is_digital, objnum_t input_number, WaitOnInpu
 
     // TODO - implement rest of modes
     return Error::GcodeValueWordInvalid;
+}
+
+// M104 — arc-referenced peck pulse (plasma peck marking).
+// Fires user digital output `output_num`, holds it while waiting for the arc-voltage
+// peak latch to cross `threshold_volts` (the actual arc start, however long this
+// supply's preflow takes on this fire), then keeps it on for `hold_s` counted FROM the
+// crossing, then turns it off. Peck time thereby means ARC-ON time on any PSU, and the
+// relay-on -> crossing latency is measured at the THC's 1 kHz sample rate as a side
+// effect.
+//
+// A timeout is a SOFT failure: output off, result 0, Error::Ok. The fire_torch
+// subroutine owns retry policy and pacing (a plasma supply's restart lockout eats
+// back-to-back re-fires), so alarming here would take that recovery away.
+static Error gc_peck_pulse(int output_num, float hold_s, float threshold_volts, float max_wait_s) {
+    if (output_num < 0 || output_num >= MaxUserDigitalPin) {
+        return Error::PParamMaxExceeded;
+    }
+    protocol_buffer_synchronize();  // fire exactly at this point in the program
+
+    uint32_t hold_ms    = (uint32_t)lroundf(hold_s * 1000.0f);
+    uint32_t timeout_ms = (uint32_t)lroundf(max_wait_s * 1000.0f);
+
+    config->_thc->resetPeak();
+    uint32_t t0 = get_ms();
+    if (!config->_userOutputs->setDigital(output_num, true)) {
+        return Error::PParamMaxExceeded;
+    }
+
+    int      fired      = 0;
+    uint32_t latency_ms = 0;
+    bool     aborted    = false;
+    while (true) {
+        uint32_t elapsed = get_ms() - t0;
+        auto     state   = Machine::peckWaitState(config->_thc->peakVoltage(), threshold_volts, elapsed, timeout_ms);
+        if (state == Machine::PeckWait::Crossed) {
+            fired      = 1;
+            latency_ms = elapsed;
+            break;
+        }
+        if (state == Machine::PeckWait::TimedOut) {
+            latency_ms = elapsed;
+            break;
+        }
+        protocol_execute_realtime();
+        if (sys.abort()) {
+            aborted = true;
+            break;
+        }
+        delay_ms(1);
+    }
+    if (fired && !aborted && hold_ms) {
+        dwell_ms(hold_ms, DwellMode::Dwell);  // bails early on abort; output is still forced off below
+    }
+    config->_userOutputs->setDigital(output_num, false);
+    if (aborted || sys.abort()) {
+        return Error::Ok;  // reset in progress; skip the report
+    }
+
+    config->_thc->setPeckResult(fired, (int)latency_ms);
+    // Broadcast so the sender-side NGC engine / serial transcript captures the result
+    // (mirrors [AIR:]). LogStream auto-appends the closing bracket.
+    log_stream(allChannels,
+               "[PECK:P" << output_num << "=" << fired << "," << latency_ms << "," << config->_thc->peakVoltage());
+    return Error::Ok;
 }

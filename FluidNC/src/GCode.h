@@ -176,6 +176,7 @@ enum class ThcControl : gcodenum_t {
     Enable     = 1,  // M101
     Disable    = 2,  // M102
     SetVoltage = 3,  // M103 Q<volts>
+    PeckPulse  = 4,  // M104 P<output> Q<hold_s> R<threshold_volts> D<max_wait_s>
 };
 
 // {M66} L word value, indicates wait mode

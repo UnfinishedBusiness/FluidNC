@@ -22,58 +22,9 @@ namespace Machine {
     static const int   StepTimerHz = 8000;
     static const float MinRateHz   = 1.0f;
 
-    // ----------------------------- pure decision -----------------------------
-
-    ThcAction thcDecide(const ThcInputs& in, float pid_p, float min_rate_hz, float max_rate_hz, float& rate_hz_out) {
-        rate_hz_out = 0.0f;
-
-        // Gates that suppress all correction (the torch holds its commanded Z):
-        //  - disabled (M102, or never M101'd)
-        //  - no arc established
-        //  - target at/below the configured minimum (the "THC off" setpoint)
-        //  - measured voltage below the configured minimum: no valid arc to regulate.
-        //    At end-of-cut the arc-OK input typically lingers a few ms after the arc
-        //    voltage has already collapsed toward 0; without this gate `error` would be
-        //    full-scale and the THC would slam Z at max rate off a non-physical reading.
-        //  - arc not yet stable (hasn't traveled the engage distance yet)
-        //  - velocity anti-dive active (feed dropped through a corner)
-        if (!in.enabled || !in.arc_ok || in.target_volts <= in.min_volts || in.avg_volts < in.min_volts ||
-            !in.stabilized || in.antidive) {
-            return ThcAction::Hold;
-        }
-
-        // error > 0  => measured voltage is low => arc gap too small => raise torch (+Z)
-        float error = in.target_volts - in.avg_volts;
-        if (std::fabs(error) <= in.threshold_volts) {
-            return ThcAction::Hold;  // inside the deadband
-        }
-
-        float rate = pid_p * std::fabs(error);
-        if (rate < min_rate_hz) {
-            rate = min_rate_hz;
-        }
-        if (rate > max_rate_hz) {
-            rate = max_rate_hz;
-        }
-        rate_hz_out = rate;
-
-        return (error > 0.0f) ? ThcAction::Up : ThcAction::Down;
-    }
-
-    ThcResolved thcResolve(ThcOvrMode mode, float m103_target, float ovr_volts, bool m101_enabled) {
-        switch (mode) {
-            case ThcOvrMode::Disabled:
-                // Forced off: M101/M102 are no-ops. Report the M103 target so the DRO
-                // still shows what the program asked for.
-                return { m103_target, false };
-            case ThcOvrMode::Override:
-                // GcodePilot's volts replace M103; arming still follows M101/M102.
-                return { ovr_volts, m101_enabled };
-            case ThcOvrMode::Gcode:
-            default:
-                return { m103_target, m101_enabled };
-        }
-    }
+    // The pure decision functions (thcDecide, thcResolve, peckWaitState) live in
+    // ThcPure.cpp so the native test build can link them without this file's
+    // service-loop/ESP32-timer dependencies.
 
     // ------------------------------- lifecycle -------------------------------
 
@@ -276,12 +227,14 @@ namespace Machine {
 
     // ------------------------------- reporting -------------------------------
 
-    // |Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>,<ovrMode>,<peak>
+    // |Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>,<ovrMode>,<peak>,<peckResult>,<peckLatencyMs>
     //   voltage  = measured arc volts; arc_ok = arc-OK input; active = currently correcting Z;
     //   target   = effective target volts (override volts when overriding, else M103 Q);
     //   enabled  = effective armed (0 when override mode is Disabled, else M101=1 / M102=0);
     //   ovrMode  = GcodePilot override mode (0 Gcode, 1 Override, 2 Disabled);
-    //   peak     = max instantaneous volts since the last M62/M64 (peck-verify latch).
+    //   peak     = max instantaneous volts since the last M62/M64 (peck-verify latch);
+    //   peckResult    = last M104 outcome: -1 none yet this boot, 0 misfire, 1 fired;
+    //   peckLatencyMs = last M104 relay-on -> voltage-crossing time (elapsed timeout on misfire).
     // target/enabled carry the *effective* values so the GcodePilot DRO follows naturally.
     // Fields are ADDITIVE ONLY — old hosts parse a prefix and ignore the rest.
     void THC::status_report(LogStream& msg) {
@@ -289,7 +242,8 @@ namespace Machine {
             thcResolve((ThcOvrMode)_ovr_mode.load(), _target_volts.load(), _ovr_volts.load(), _enabled.load());
         msg << "|Arc:" << setprecision(1) << _arc_volts.load() << "," << (_arc_ok.load() ? 1 : 0) << ","
             << (_active.load() ? 1 : 0) << "," << setprecision(1) << eff.target_volts << "," << (eff.armed ? 1 : 0)
-            << "," << _ovr_mode.load() << "," << setprecision(1) << _peak_volts.load();
+            << "," << _ovr_mode.load() << "," << setprecision(1) << _peak_volts.load() << "," << _last_peck_result.load()
+            << "," << _last_peck_latency_ms.load();
     }
 
 #ifdef __FLUIDNC

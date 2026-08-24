@@ -13,16 +13,46 @@ A complete machine config is in
 
 ## G-code interface
 
-Three dedicated M-codes in the LinuxCNC user-defined band (M100–M199):
+Four dedicated M-codes in the LinuxCNC user-defined band (M100–M199):
 
 | Code | Action |
 |------|--------|
 | `M101` | Enable THC (motion-synchronized — engages at the next motion boundary) |
 | `M102` | Disable THC (motion-synchronized) |
 | `M103 Q<volts>` | Set the target arc voltage. `Q` at or below the configured `min_arc_voltage` turns correction off. |
+| `M104 P<out> Q<s> R<volts> D<s>` | Arc-referenced peck pulse — see *Firmware-timed peck (M104)* below. |
 
 LinuxCNC has no M-code that sets a numeric arc voltage (it uses material files), so
 `M103 Q` is a purpose-built FluidNC command rather than a reused one.
+
+### Firmware-timed peck (M104)
+
+`M104 P<output> Q<hold_s> R<threshold_volts> D<max_wait_s>` runs a plasma **peck mark**
+(a tiny drill-locating divot) as one blocking firmware operation:
+
+1. `protocol_buffer_synchronize()` — fires exactly at this point in the program;
+2. reset the peak-voltage latch, close user digital output `P`;
+3. wait for the latched peak to cross `R` volts — the **actual arc start**, however long
+   this supply's preflow takes on this fire (sampled by the THC's 1 kHz service loop; the
+   latch catches a blip shorter than any poll);
+4. on the crossing, hold the output for `Q` seconds **counted from the crossing**, then open it;
+5. no crossing within `D` seconds → open the output and report a misfire — a **soft**
+   failure (`ok`, never an alarm): the sender's subroutine owns retry pacing.
+
+Peck time thereby means **arc-on time** on any plasma supply — identical on a Powermax
+that latches a 70 ms start pulse and an EX-TRAFIRE that needs START held ~1.2 s through a
+cold preflow — and the relay-on → crossing latency is measured at 1 ms resolution as a side
+effect. All four words are required; `R` and `D` must be positive (`Q0` is legal: fire,
+verify the crossing, open immediately). Requires a `thc:` section (`error:20` without one).
+
+Each M104 emits one report just before its `ok` (mirrors `[AIR:]`):
+
+```
+[PECK:P<output>=<fired 0|1>,<latency_ms>,<peak_volts>]
+```
+
+and latches the outcome into `Arc:` status fields 7 and 8 (below) for pollers. The V-word
+is deliberately NOT used for the threshold — `V` is the V-axis letter in the parser.
 
 Typical program shape:
 
@@ -125,7 +155,7 @@ When `thc:` is present, **every** `?` status report carries an arc field so a se
 can drive a live DRO and AVTHC indicators:
 
 ```
-|Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>,<ovrMode>
+|Arc:<voltage>,<arc_ok>,<active>,<target>,<enabled>,<ovrMode>,<peak>,<peckResult>,<peckLatencyMs>
 ```
 
 | idx | field   | type        | meaning |
@@ -136,8 +166,11 @@ can drive a live DRO and AVTHC indicators:
 | 3   | target  | float (1dp) | **effective target voltage** — override volts when overriding, else `M103 Q` (`0` until set) |
 | 4   | enabled | `0`/`1`     | **effective armed** — `0` when override mode is Disabled, else `M101`=1 / `M102`=0 |
 | 5   | ovrMode | `0`/`1`/`2` | operator override mode: `0` Gcode Controlled, `1` Override, `2` Disabled |
+| 6   | peak    | float (1dp) | max instantaneous volts since the last user digital output ON (`M62`/`M64`) — the peck-verify latch |
+| 7   | peckResult | `-1`/`0`/`1` | last `M104` outcome: `-1` no peck yet this boot, `0` misfire, `1` fired |
+| 8   | peckLatencyMs | int | last `M104` relay-on → voltage-crossing time, ms (elapsed timeout on a misfire) |
 
-Example: `|Arc:123.4,1,1,120.0,1,0`.
+Example: `|Arc:123.4,1,1,120.0,1,0,131.7,1,412`.
 
 `target` and `enabled` carry the **effective** values (after the override mode is applied), so a
 sender DRO that already reads them follows the override automatically; `ovrMode` tells the sender
@@ -154,10 +187,11 @@ means correction is effectively off even when `enabled=1` (the firmware's THC-OF
 
 ### Sender mapping
 
-Parse the `|Arc:` CSV → `{ voltage, arcOk, active, target, enabled, ovrMode }`. Positions 0-2
-are unchanged from earlier firmware, and 3-5 are additive — a 3-field `|Arc:` from an older build
-still parses (treat missing `target`/`enabled`/`ovrMode` as unset). Send the operator-override
-bytes from the *Operator override* table above to drive it live.
+Parse the `|Arc:` CSV → `{ voltage, arcOk, active, target, enabled, ovrMode, peak, peckResult,
+peckLatencyMs }`. Positions 0-2 are unchanged from earlier firmware, and everything after is
+**additive only** — a 3-, 6- or 7-field `|Arc:` from an older build still parses (treat missing
+fields as unset). Never reorder or remove a field. Send the operator-override bytes from the
+*Operator override* table above to drive it live.
 
 ## Z motion injection — requirements
 
