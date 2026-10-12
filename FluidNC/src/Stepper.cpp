@@ -19,10 +19,54 @@
 #    include "Machine/JogStepper.h"
 #endif
 #include <cmath>
+#include <atomic>
+#ifndef __FLUIDNC
+#    include <mutex>
+#endif
 
 using namespace Stepper;
 
-static bool awake = false;
+static std::atomic<bool> awake { false };
+
+// Published only after the preceding pulse is emitted, when the ISR activates a
+// segment. Store float bit patterns as integers: ESP32 interrupt code must not use
+// the FPU. Both readers (THC/status tasks) and lifecycle invalidation use the same
+// tiny critical section. Interrupts are masked while a task owns the mux, so the
+// step ISR cannot spin on a writer it has interrupted. No math/logging in the lock.
+struct motion_raw_t {
+    uint32_t rate;
+    uint32_t programmed;
+    uint32_t flags;
+};
+static motion_raw_t executing_motion {};
+static constexpr uint32_t MotionValid = 1;
+static constexpr uint32_t MotionCutting = 2;
+#ifdef __FLUIDNC
+static portMUX_TYPE motion_mux = portMUX_INITIALIZER_UNLOCKED;
+#else
+static std::mutex motion_mux;
+#endif
+
+static void IRAM_ATTR publish_motion(uint32_t rate, uint32_t programmed, uint32_t flags) {
+#ifdef __FLUIDNC
+    portENTER_CRITICAL_ISR(&motion_mux);
+#else
+    std::lock_guard<std::mutex> lock(motion_mux);
+#endif
+    executing_motion.rate = rate;
+    executing_motion.programmed = programmed;
+    executing_motion.flags = flags;
+#ifdef __FLUIDNC
+    portEXIT_CRITICAL_ISR(&motion_mux);
+#endif
+}
+
+static uint32_t motion_float_bits(float value) {
+    static_assert(sizeof(float) == sizeof(uint32_t), "Motion rate must fit one word");
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
 
 // Stores the planner block Bresenham algorithm execution data for the segments in the segment
 // buffer. Normally, this buffer is partially in-use, but, for the worst case scenario, it will
@@ -49,6 +93,7 @@ struct segment_t {
     uint8_t      amass_level;        // AMASS level for the ISR to execute this segment
     uint32_t     spindle_dev_speed;  // Spindle speed scaled to the device
     SpindleSpeed spindle_speed;      // Spindle speed in GCode units
+    motion_raw_t motion;             // Executed timer rate + this segment's owning block feed
 };
 static segment_t* segment_buffer = nullptr;
 
@@ -177,6 +222,7 @@ static st_prep_t prep;
 
 // Stepper shutdown
 void IRAM_ATTR Stepper::stop_stepping() {
+    publish_motion(0, 0, 0);
     Stepping::unstep();
     st.step_outbits = 0;
 }
@@ -247,6 +293,7 @@ bool IRAM_ATTR Stepper::pulse_func() {
             // Initialize step segment timing per step and load number of steps to execute.
             Stepping::setTimerPeriod(st.exec_segment->isrPeriod);
             st.step_count = st.exec_segment->n_step;  // NOTE: Can sometimes be zero when moving slow.
+            publish_motion(st.exec_segment->motion.rate, st.exec_segment->motion.programmed, st.exec_segment->motion.flags);
             // If the new segment starts a new planner block, initialize stepper variables and counters.
             // NOTE: When the segment data index changes, this indicates a new planner block.
             if (st.exec_block_index != st.exec_segment->st_block_index) {
@@ -307,6 +354,7 @@ void Stepper::wake_up() {
     if (awake) {
         return;
     }
+    publish_motion(0, 0, 0);  // no executing segment until the first pulse callback loads one
     awake = true;
     // Cancel any pending stepper disable
     protocol_cancel_disable_steppers();
@@ -763,6 +811,17 @@ void Stepper::prep_buffer() {
         // largest value that will fit in a uint16_t.
         prep_segment->isrPeriod = timerTicks > 0xffff ? 0xffff : timerTicks;
 
+        // Use the FINAL timer period and AMASS scaling, not the ramp endpoint.
+        // The block may leave the planner before execution, so every segment owns
+        // its reference. Injected THC Z steps do not contribute to this path speed.
+        float rate = (float(Stepping::fStepperTimer) * 60.0f) /
+                     (float(prep_segment->isrPeriod) * float(1u << level) * prep.step_per_mm);
+        bool cutting = !pl_block->motion.rapidMotion && !pl_block->motion.systemMotion && !pl_block->is_jog &&
+                       (pl_block->steps[X_AXIS] || pl_block->steps[Y_AXIS]);
+        prep_segment->motion.rate = motion_float_bits(rate);
+        prep_segment->motion.programmed = motion_float_bits(pl_block->programmed_rate);
+        prep_segment->motion.flags = MotionValid | (cutting ? MotionCutting : 0);
+
         // Segment complete! Increment segment buffer indices, so stepper ISR can immediately execute it.
         auto lastseg        = segment_next_head;
         segment_next_head   = segment_next_head >= (Stepping::_segments - 1) ? 0 : segment_next_head + 1;
@@ -797,26 +856,53 @@ void Stepper::prep_buffer() {
     }
 }
 
-// Called by realtime status reporting to fetch the current speed being executed. This value
-// however is not exactly the current speed, but the speed computed in the last step segment
-// in the segment buffer. It will always be behind by up to the number of segment blocks (-1)
-// divided by the ACCELERATION TICKS PER SECOND in seconds.
-float Stepper::get_realtime_rate() {
-#ifdef ENABLE_FW_JOG
-    // A direct-stepper jog bypasses the planner, so prep.current_speed is stale. Report the jog
-    // engine's commanded velocity (the rate the DDA is actually stepping at) for the |FS: field.
-    if (Machine::JogStepper::active()) {
-        return Machine::JogStepper::currentRateMmMin();
-    }
-#endif
-    switch (sys.state()) {
+// Unlike prep.current_speed, this snapshot describes the segment whose timer is
+// running now. Retirement does not clear it: the last computed pulse still has
+// to be emitted on the next callback, before a new segment or stop is published.
+Stepper::MotionSnapshot Stepper::get_executing_motion() {
+    const State state = sys.state();
+    switch (state) {
         case State::Cycle:
         case State::Homing:
         case State::Hold:
         case State::Jog:
         case State::SafetyDoor:
-            return prep.current_speed;
+            break;
         default:
-            return 0.0f;
+            return {};
     }
+#ifdef ENABLE_FW_JOG
+    if (Machine::JogStepper::active()) {
+        return {};  // direct jog is never a THC cutting reference
+    }
+#endif
+    motion_raw_t raw;
+#ifdef __FLUIDNC
+    portENTER_CRITICAL(&motion_mux);
+#else
+    std::lock_guard<std::mutex> lock(motion_mux);
+#endif
+    raw = executing_motion;
+#ifdef __FLUIDNC
+    portEXIT_CRITICAL(&motion_mux);
+#endif
+    if (!awake || !(raw.flags & MotionValid) || sys.abort()) {
+        return {};
+    }
+    MotionSnapshot motion;
+    memcpy(&motion.rate, &raw.rate, sizeof(float));
+    memcpy(&motion.programmed, &raw.programmed, sizeof(float));
+    motion.valid = true;
+    motion.cutting = (raw.flags & MotionCutting) && state == State::Cycle && !sys.step_control.executeHold;
+    return motion;
+}
+
+float Stepper::get_realtime_rate() {
+#ifdef ENABLE_FW_JOG
+    // Direct-stepper jogging bypasses the segment queue and retains its own rate.
+    if (Machine::JogStepper::active()) {
+        return Machine::JogStepper::currentRateMmMin();
+    }
+#endif
+    return get_executing_motion().rate;
 }

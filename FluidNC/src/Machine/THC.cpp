@@ -4,8 +4,7 @@
 #include "THC.h"
 
 #include "MachineConfig.h"  // config, Axes, Stepping
-#include "../Stepper.h"     // Stepper::get_realtime_rate
-#include "../GCode.h"       // gc_state
+#include "../Stepper.h"     // coherent executing-segment speed and programmed feed
 #include "../Logging.h"     // LogStream, log_*
 
 #include <cmath>
@@ -146,7 +145,8 @@ namespace Machine {
         // Distance gate: accumulate path length traveled since the arc established. The torch
         // is stationary through the pierce dwell (realtime rate ~0), so distance only grows once
         // cutting motion resumes — pierce duration (which scales with thickness) drops out.
-        float realtime = Stepper::get_realtime_rate();  // vector XY feed, mm/min
+        const auto motion = Stepper::get_executing_motion();
+        const float realtime = motion.valid && motion.cutting ? motion.rate : 0.0f;  // executed cut-path feed, mm/min
         if (ok && !_arc_ok_prev) {
             _arc_distance_mm = 0.0f;  // arc just rose — start measuring path length
             _last_service_us = now;
@@ -161,14 +161,10 @@ namespace Machine {
         _arc_ok_prev     = ok;
         bool stabilized  = ok && (_arc_distance_mm >= _thc_engage_distance_mm);
 
-        // velocity anti-dive: suppress while the feed has dropped through a corner
-        bool antidive = false;
-        if (_vad_threshold_pct > 0) {
-            float programmed = gc_state.feed_rate;
-            if (programmed > 0.0f && realtime < programmed * (_vad_threshold_pct / 100.0f)) {
-                antidive = true;
-            }
-        }
+        // Hold immediately on a slow/invalid executing segment. Resume only once
+        // the voltage average contains a full window of speed-qualified samples.
+        // Parser feed and preparation-tail speed can both belong to future moves.
+        const bool antidive = _velocity_gate.update(motion, _vad_threshold_pct, _avg_samples);
 
         // Manual compensation overrides the control loop: while a comp direction is held,
         // drive Z up/down at the manual rate regardless of arc voltage. GcodePilot switches

@@ -5,6 +5,7 @@
 
 #include "Configuration/Configurable.h"
 #include "Pin.h"
+#include "../Stepper.h"
 
 #include <atomic>
 
@@ -35,6 +36,19 @@ namespace Machine {
     // Pure: the same inputs always yield the same result, so it is unit-testable
     // without any ESP32 hardware.
     ThcAction thcDecide(const ThcInputs& in, float pid_p, float min_rate_hz, float max_rate_hz, float& rate_hz_out);
+
+    // Invalid/non-cutting motion holds even when 0 disables the percentage test.
+    bool thcVelocityAntidive(const Stepper::MotionSnapshot& motion, int threshold_pct);
+
+    // A moving average must contain only speed-qualified samples before resuming
+    // correction. Window length is the existing avg_samples setting, not a time
+    // chosen to compensate for planner look-ahead.
+    class ThcVelocityGate {
+    public:
+        bool update(const Stepper::MotionSnapshot& motion, int threshold_pct, unsigned avg_samples);
+    private:
+        unsigned _qualified_samples = 0;
+    };
 
     // ---- Override mode (set live from GcodePilot over real-time commands) ----
     // Gcode    : the program's M101/M102/M103 are in charge (the default).
@@ -142,6 +156,8 @@ namespace Machine {
         void manualCompStop() { _manual_dir.store(0); }
 
     private:
+        ThcVelocityGate _velocity_gate;
+
         // ---- Configuration (YAML) ----
         Pin   _arc_voltage_pin;          // analog input carrying (divided) arc voltage
         Pin   _arc_ok_pin;               // digital input, asserted when the arc is established

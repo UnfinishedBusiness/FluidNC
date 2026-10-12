@@ -104,9 +104,22 @@ A background loop samples the arc voltage (moving-averaged) and moves Z only whe
   which keeps engagement consistent across material thicknesses (thicker stock pierces
   longer but still engages after the same distance of travel).
 - **Velocity anti-dive** is not active. When the actual feed drops below
-  `vad_threshold_pct` of the programmed feed (e.g. decelerating into a corner), the
+  `vad_threshold_pct` of the executing move's programmed feed (e.g. decelerating into a corner), the
   arc voltage rises for reasons unrelated to height, so correction is suspended to
-  stop the torch diving.
+  stop the torch diving. Speed comes from the executing segment's final step timing;
+  queued future acceleration and future F words cannot release this gate. The reference
+  remains the programmed feed before overrides: a 50% feed override stays below a
+  90% threshold, including when an axis-rate limit prevents reaching the requested feed.
+- There is valid cutting motion: an ordinary feed move containing X/Y motion while
+  the machine is in Cycle. Stationary dwell, stop, hold, rapid, jog, homing and Z-only
+  moves do not permit automatic correction. A 0% setting disables the percentage
+  comparison, not this motion-validity requirement. Manual compensation is unchanged.
+- After a velocity hold, `avg_samples` consecutive voltage samples have been taken
+  with speed-qualified motion. This prevents slow-corner samples remaining in the
+  voltage average from commanding a dive on recovery. At the nominal 1 kHz service
+  rate this is at most 16 samples (about 16 ms), determined by the existing averaging
+  setting rather than a fixed compensation for queue latency. A one-sample average
+  resumes on its first qualified sample.
 - The voltage error exceeds the `threshold_volts` deadband.
 
 Inside those gates a proportional term (`pid_p`) sets the Z step rate, capped by
@@ -150,6 +163,16 @@ is seamless; the operator clicks back to auto when done.
 > engine as THC itself (see *Z motion injection* below).
 
 ## Status reporting
+
+The existing `FS` feed field reports the executing segment's timer-derived path
+speed, with the same units and rounding as before. It no longer reads the speed
+at the end of the prepared segment queue. Direct-stepper jogging retains its own
+engine's rate. This is commanded step timing, not an encoder measurement; a
+streaming step engine can add its own hardware buffering. THC requires the direct
+`timed` engine. No sender update or new status/series fields are required.
+
+See [motion regression and validation](thc-motion-validation.md) for implementation
+invariants, host tests, and the verified rig acceptance.
 
 When `thc:` is present, **every** `?` status report carries an arc field so a sender
 can drive a live DRO and AVTHC indicators:

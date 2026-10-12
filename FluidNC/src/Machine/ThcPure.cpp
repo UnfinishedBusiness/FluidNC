@@ -50,6 +50,26 @@ namespace Machine {
         return (error > 0.0f) ? ThcAction::Up : ThcAction::Down;
     }
 
+    bool thcVelocityAntidive(const Stepper::MotionSnapshot& motion, int threshold_pct) {
+        if (!motion.valid || !motion.cutting || !std::isfinite(motion.rate) || !std::isfinite(motion.programmed) ||
+            motion.rate <= 0.0f || motion.programmed <= 0.0f) {
+            return true;
+        }
+        return threshold_pct > 0 && motion.rate < motion.programmed * (float(threshold_pct) / 100.0f);
+    }
+
+    bool ThcVelocityGate::update(const Stepper::MotionSnapshot& motion, int threshold_pct, unsigned avg_samples) {
+        if (thcVelocityAntidive(motion, threshold_pct)) {
+            _qualified_samples = 0;
+            return true;
+        }
+        const unsigned window = avg_samples < 1 ? 1 : (avg_samples > 16 ? 16 : avg_samples);
+        if (_qualified_samples < window) {
+            ++_qualified_samples;
+        }
+        return _qualified_samples < window;
+    }
+
     ThcResolved thcResolve(ThcOvrMode mode, float m103_target, float ovr_volts, bool m101_enabled) {
         switch (mode) {
             case ThcOvrMode::Disabled:

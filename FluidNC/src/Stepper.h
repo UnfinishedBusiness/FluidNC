@@ -42,7 +42,17 @@ namespace Stepper {
     // Called by planner_recalculate() when the executing block is updated by the new plan.
     bool update_plan_block_parameters();
 
-    // Called by realtime status reporting if realtime rate reporting is enabled in config.h.
+    struct MotionSnapshot {
+        float rate = 0.0f;        // executing segment's timer-derived path speed, mm/min
+        float programmed = 0.0f;  // owning block's programmed feed, mm/min, before overrides
+        bool valid = false;
+        bool cutting = false;    // ordinary XY feed motion in Cycle, not hold/jog/rapid/system
+    };
+
+    // Coherent copy, never a pointer into the recyclable planner/segment rings.
+    MotionSnapshot get_executing_motion();
+
+    // Executing path speed for FS/debug reporting; direct-stepper jog uses its own engine.
     float get_realtime_rate();
 
     extern uint32_t isr_count;

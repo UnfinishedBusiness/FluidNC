@@ -15,6 +15,11 @@ feature: what it does, the `config.yaml` it uses, and the sender-facing behavior
 All of these are inert unless explicitly enabled in `config.yaml`, so they do not
 change behavior for existing machines or senders.
 
+## Plasma torch height control
+
+- [AVTHC configuration and behavior](avthc.md)
+- [Executing-motion regression and validation](thc-motion-validation.md)
+
 ## New `config.yaml` pin attributes
 
 These pages add pin attributes that combine with the existing ones (`:low`, `:high`,
