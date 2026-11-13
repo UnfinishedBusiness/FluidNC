@@ -14,6 +14,7 @@
 extern volatile bool probing;  // Probing state value.  Used to coordinate the probing cycle with stepper ISR.
 
 extern bool probe_succeeded;  // Tracks if last probing cycle was successful.
+extern uint8_t probe_trip_mask;  // ProbeTripBits latched at the last probe trip (0 = none).
 
 // Execute a linear motion in cartesian space.
 bool mc_linear(float* target, plan_line_data_t* pl_data, float* position);

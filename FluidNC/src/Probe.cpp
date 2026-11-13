@@ -5,6 +5,7 @@
 #include "Probe.h"
 #include "Machine/EventPin.h"
 #include "Machine/MachineConfig.h"
+#include "ProbeTrip.h"
 
 extern void    protocol_do_probe(void* arg);
 const ArgEvent probeEvent { protocol_do_probe };
@@ -39,6 +40,18 @@ bool Probe::tripped() {
     return get_state() ^ _away;
 }
 
+uint8_t Probe::tripMask() {
+    bool watchProbe      = _source != ProbeSource::ToolsetterOnly;
+    bool watchToolsetter = _source != ProbeSource::ProbeOnly;
+    return probeTripMask(_probePin.defined(),
+                         watchProbe,
+                         _probePin.get(),
+                         _toolsetterPin.defined(),
+                         watchToolsetter,
+                         _toolsetterPin.get(),
+                         _away);
+}
+
 void Probe::validate() {}
 
 void Probe::group(Configuration::HandlerBase& handler) {
@@ -53,6 +66,9 @@ void protocol_do_probe(void* arg) {
     if (p->tripped() && probing) {
         probing = false;
         get_steps(probe_steps);
+        // Latch WHICH input tripped, at the trip — the status `Pn:` field is sampled independently and
+        // can race the `[PRB:]` report (or miss a short floating-head bounce entirely).
+        probe_trip_mask = p->tripMask();
         if (p->_hard_stop) {
             Stepper::reset();
             plan_reset();

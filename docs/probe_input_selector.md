@@ -56,6 +56,22 @@ The two inputs are reported independently in the `?` status report's `|Pn:` fiel
 - `G38.3 D2 …` on the ohmic pin only,
 - omitted / `D0` on either (the original OR).
 
+## Trip source in the probe report
+
+The firmware latches **which input tripped** at the moment of the trip (in `protocol_do_probe`) and
+appends it as an optional 4th field of the probe report:
+
+```
+[PRB:<x>,<y>,<z>:<ok>:<src>]      e.g.  [PRB:0.000,0.000,-12.345:1:T]
+```
+
+`<src>` uses the `|Pn:` letters: `P` = `probe.pin`, `T` = `probe.toolsetter_pin`, `PT` = both
+(ambiguous). Only inputs that are configured **and** watched by the cycle's `D<sel>` count, and for
+`G38.4/.5` (away) an input counts when it has released. The field is **omitted** on a failed probe
+(`:0`) or when nothing was latched, so the stock `[PRB:x,y,z:ok]` form is unchanged and hosts that
+read only the first three fields + flag are unaffected. JetCad3's GcodePilot driver already parses
+it (`controller.js`, default map `float: 'P'`, `ohmic: 'T'`).
+
 ## Implementation
 
 - `src/Probe.h` / `src/Probe.cpp` — `enum class ProbeSource { Both, ProbeOnly, ToolsetterOnly }`, a transient

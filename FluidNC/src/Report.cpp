@@ -19,7 +19,8 @@
 #include "Machine/JogCapabilities.h"
 #include "Machine/MachineConfig.h"
 #include "SettingsDefinitions.h"
-#include "MotionControl.h"               // probe_succeeded
+#include "MotionControl.h"               // probe_succeeded, probe_trip_mask
+#include "ProbeTrip.h"                   // probeReportSourceSuffix
 #include "Limit.h"                       // limits_get_state
 #include "Planner.h"                     // plan_get_block_buffer_available
 #include "Stepper.h"                     // step_count
@@ -203,7 +204,12 @@ void report_probe_parameters(Channel& channel) {
     float print_position[MAX_N_AXIS];
     steps_to_mpos(print_position, probe_steps);
 
-    log_stream(channel, "[PRB:" << report_util_axis_values(print_position) << ":" << probe_succeeded);
+    // Optional 4th field = latched trip source (`P` probe.pin, `T` toolsetter_pin, `PT` both), e.g.
+    // `[PRB:0.000,0.000,-12.345:1:T]`. Omitted on failure / no latch, so the stock form is unchanged;
+    // hosts that split on ':' and read only the first three fields + flag are unaffected.
+    log_stream(channel,
+               "[PRB:" << report_util_axis_values(print_position) << ":" << probe_succeeded
+                       << probeReportSourceSuffix(probe_succeeded, probe_trip_mask));
 }
 
 // Prints NGC parameters (coordinate offsets, probing)

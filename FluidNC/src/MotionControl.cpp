@@ -279,6 +279,8 @@ volatile bool probing;
 
 bool probe_succeeded = false;
 
+uint8_t probe_trip_mask = 0;
+
 // Perform tool length probe cycle. Requires probe switch.
 // NOTE: Upon probe failure, the program will be stopped and placed into ALARM state.
 GCUpdatePos mc_probe_cycle(float* target, plan_line_data_t* pl_data, bool away, bool no_error, AxisMask offsetAxis, float offset, ProbeSource source) {
@@ -300,6 +302,7 @@ GCUpdatePos mc_probe_cycle(float* target, plan_line_data_t* pl_data, bool away, 
 
     // Initialize probing control variables
     probe_succeeded = false;  // Re-initialize probe history before beginning cycle.
+    probe_trip_mask = 0;      // ...including the latched trip source (ProbeTrip.h).
     config->_probe->set_direction(away);
     // Apply the per-block probe-input selector for this cycle only. Set BEFORE the pre-trigger check
     // below so that, too, honors the mask, and restored to Both on every exit path so it never leaks.

@@ -80,6 +80,10 @@ public:
         }
     }
 
+    // Which input(s) satisfied this cycle's trip condition right now (ProbeTripBits), honoring the
+    // `D<sel>` selector and the toward/away direction. Latched by protocol_do_probe at the trip.
+    uint8_t tripMask();
+
     ProbeEventPin& probePin() { return _probePin; }
     ProbeEventPin& toolsetterPin() { return _toolsetterPin; }
 
