@@ -153,6 +153,22 @@ void execute_realtime_command(Cmd command, Channel& channel) {
                 config->_thc->manualCompStop();
             }
             break;
+        case Cmd::ThcLeaseUp:
+        case Cmd::ThcLeaseDown:
+            if (config && config->_thc && state_is(State::Cycle)) {
+                config->_thc->manualLeaseStart(command == Cmd::ThcLeaseUp ? 1 : -1);
+            }
+            break;
+        case Cmd::ThcLeaseRenew:
+            if (config && config->_thc && state_is(State::Cycle)) {
+                config->_thc->manualLeaseRenew();
+            }
+            break;
+        case Cmd::ThcCaptureArc:
+            if (config && config->_thc && state_is(State::Cycle)) {
+                config->_thc->ovrCaptureArc();
+            }
+            break;
         default:  // None
             break;
     }

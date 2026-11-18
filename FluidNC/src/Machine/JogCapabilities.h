@@ -8,6 +8,12 @@
 #include <cstdio>
 
 namespace Machine {
+#ifdef ENABLE_FW_JOG
+    inline constexpr bool HasFwJog = true;
+#else
+    inline constexpr bool HasFwJog = false;
+#endif
+
     // The exact legacy line a sender parses byte-for-byte to feature-detect the firmware vector-jog
     // engine. Both brackets are part of the literal. (Path shuttle was removed; shuttle now runs
     // host-side via $J=, so FWSHU is no longer advertised.)
@@ -24,9 +30,14 @@ namespace Machine {
     // whenever the port opens after boot). Tokens are ADDITIVE ONLY (k=v, comma-separated); the value
     // is sanitized so it can never carry ',', '[', ']' or spaces, which would break token parsing.
     template <typename ChannelLike>
-    inline void reportFwJogCapabilities(ChannelLike& channel, const char* build_info = nullptr) {
+    inline void reportFwJogCapabilities(ChannelLike& channel, const char* build_info = nullptr, bool thc_manual = false,
+                                        bool fw_jog = true) {
+        const char* jog = fw_jog ? "FWJOG=1" : "";
+        const char* thc = thc_manual ? "THCMAN=1" : "";
+        char line[112];
         if (build_info == nullptr || *build_info == '\0') {
-            channel.sendLine(MsgLevelNone, FwJogCapabilitiesReport);
+            snprintf(line, sizeof(line), "[CAP:%s%s%s]", jog, fw_jog && thc_manual ? "," : "", thc);
+            channel.sendLine(MsgLevelNone, line);
             return;
         }
         char   ver[64];
@@ -39,8 +50,8 @@ namespace Machine {
             ver[n++] = c;
         }
         ver[n] = '\0';
-        char line[96];
-        snprintf(line, sizeof(line), "[CAP:FWJOG=1,VER=%s]", ver);
+        snprintf(line, sizeof(line), "[CAP:%s%sVER=%s%s%s]", jog, fw_jog ? "," : "",
+                 ver, thc_manual ? "," : "", thc);
         channel.sendLine(MsgLevelNone, line);
     }
 }

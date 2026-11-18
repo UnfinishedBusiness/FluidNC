@@ -139,8 +139,11 @@ picked off the serial stream like the feed/spindle override bytes — they never
 | `0xA3` | THC volt − | override target **−1 V** (same seeding). |
 | `0xA4` | THC Gcode | mode → **Gcode Controlled** — clears the override; `M101/M102/M103` are back in charge. |
 | `0xA5` | THC Disable | mode → **Disabled** — THC is forced off; `M101/M102` become no-ops for the rest of the run. |
-| `0xA6` | Manual comp up | move Z **up** continuously at `manual_comp_rate_mm_min` (only while `State == Cycle`). |
+| `0xA6` | Legacy manual comp up | move Z **up** continuously at `manual_comp_rate_mm_min` (only while `State == Cycle`). |
 | `0xA7` | Manual comp down | move Z **down** continuously. |
+| `0xA9` / `0xAA` | Timed manual comp up/down | Start a hold while a cut is executing with override Disabled. |
+| `0xAC` | Renew manual comp | Renew an active hold for 400 ms. An expired hold needs a new start. |
+| `0xAB` | Capture live arc target | Set the target from the measured arc voltage and enter Override during the cut. |
 | `0xA8` | Manual comp stop | stop manual comp. |
 
 **Override modes** (reported as `ovrMode` in the status field below):

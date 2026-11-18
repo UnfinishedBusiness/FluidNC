@@ -52,6 +52,10 @@ enum class Cmd : uint8_t {
     ThcManualUp           = 0xA6,  // manual Z comp up (continuous, while running)
     ThcManualDown         = 0xA7,  // manual Z comp down
     ThcManualStop         = 0xA8,  // stop manual Z comp
+    ThcLeaseUp            = 0xA9,  // start a timed manual-comp hold
+    ThcLeaseDown          = 0xAA,
+    ThcCaptureArc         = 0xAB,  // re-enable Override at the measured voltage
+    ThcLeaseRenew         = 0xAC,  // refresh an active hold without starting one
     // Channel Extender uses the Bx range; see Channel.h
 };
 

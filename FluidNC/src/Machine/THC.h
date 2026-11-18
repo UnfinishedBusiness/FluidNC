@@ -6,6 +6,7 @@
 #include "Configuration/Configurable.h"
 #include "Pin.h"
 #include "../Stepper.h"
+#include "ThcManualLease.h"
 
 #include <atomic>
 
@@ -151,9 +152,14 @@ namespace Machine {
         void ovrSetDisabled() { _ovr_mode.store((int)ThcOvrMode::Disabled); }
 
         // ---- Manual Z compensation (RT comp up/down/stop during a cut) ----
-        void manualCompUp() { _manual_dir.store(1); }
-        void manualCompDown() { _manual_dir.store(-1); }
-        void manualCompStop() { _manual_dir.store(0); }
+        void manualCompUp() { _manual_lease.stop(); _manual_dir.store(1); }
+        void manualCompDown() { _manual_lease.stop(); _manual_dir.store(-1); }
+        void manualCompStop() { _manual_lease.stop(); _manual_dir.store(0); }
+
+        bool manualLeaseSupported() const;
+        void manualLeaseStart(int direction);
+        void manualLeaseRenew();
+        void ovrCaptureArc();
 
     private:
         ThcVelocityGate _velocity_gate;
@@ -187,7 +193,9 @@ namespace Machine {
         // ---- Override state (set from GcodePilot real-time commands) ----
         std::atomic<int>   _ovr_mode { (int)ThcOvrMode::Gcode };
         std::atomic<float> _ovr_volts { 0.0f };
-        std::atomic<int>   _manual_dir { 0 };  // +1 up, -1 down, 0 stop
+        std::atomic<int>   _manual_dir { 0 };  // legacy untimed commands
+        ThcManualLease     _manual_lease;
+        bool               _leased_step = false;  // same timer task as service() and stepTick()
 
         // ---- Control loop (ESP32 only) ----
         void service();    // 1 kHz: read voltage, decide direction + rate

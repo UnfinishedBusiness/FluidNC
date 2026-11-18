@@ -11,6 +11,7 @@
 #include "Configuration/AfterParse.h"
 #include "Configuration/Validator.h"
 #include "Machine/Axes.h"
+#include "Machine/JogCapabilities.h"
 #include "Regexpr.h"
 #include "WebUI/Authentication.h"
 #include "Report.h"
@@ -1005,7 +1006,6 @@ static Error list_parameters(const char* value, AuthenticationLevel auth_level, 
 
 #ifdef ENABLE_FW_JOG
 #    include "Machine/JogCommand.h"
-#    include "Machine/JogCapabilities.h"
 static Error fwJogStart(const char* value, AuthenticationLevel, Channel& out) {
     if (!config->_jogging) {
         return Error::InvalidStatement;
@@ -1029,14 +1029,16 @@ static Error fwJogStop(const char* value, AuthenticationLevel, Channel& out) {
     }
     return config->_jogging->stop(out);
 }
+#endif
+
 static Error fwCapReport(const char* value, AuthenticationLevel, Channel& out) {
     // On-demand capability line. The boot banner is missed when the sender opens the port after
     // boot, and $I is Idle-gated host-side (a must_home board sits in Alarm:Unhomed) — so a sender
     // queries $Cap right at connect, in ANY state, and feature-detects deterministically.
-    Machine::reportFwJogCapabilities(out, git_info);
+    Machine::reportFwJogCapabilities(out, git_info, config && config->_thc && config->_thc->manualLeaseSupported(),
+                                     Machine::HasFwJog);
     return Error::Ok;
 }
-#endif
 
 // Commands use the same syntax as Settings, but instead of setting or
 // displaying a persistent value, a command causes some action to occur.
@@ -1126,8 +1128,8 @@ void make_user_commands() {
     new AsyncUserCommand("JGS", "Jog/Start", fwJogStart, anyState);
     new AsyncUserCommand("JGF", "Jog/Feed", fwJogFeed, anyState);
     new AsyncUserCommand("JGX", "Jog/Stop", fwJogStop, anyState);
-    new AsyncUserCommand("CAP", "Cap", fwCapReport, anyState);
 #endif
+    new AsyncUserCommand("CAP", "Cap", fwCapReport, anyState);
     new AsyncUserCommand("G", "GCode/Modes", report_gcode, anyState);
 };
 

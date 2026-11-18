@@ -188,11 +188,9 @@ void report_init_message(Channel& channel) {
     }
     // When msg goes out of scope, the destructor will send the line
 
-#ifdef ENABLE_FW_JOG
-    // Advertise the firmware-native vector-jog engine on the boot banner too, so a sender can
-    // feature-detect without issuing $I. git_info rides along as VER= (build identity).
-    Machine::reportFwJogCapabilities(channel, git_info);
-#endif
+    // Include the boot-time capability line for senders that connect before startup completes.
+    Machine::reportFwJogCapabilities(channel, git_info, config && config->_thc && config->_thc->manualLeaseSupported(),
+                                     Machine::HasFwJog);
 }
 
 // Prints current probe parameters. Upon a probe command, these parameters are updated upon a
@@ -417,11 +415,8 @@ void report_build_info(const char* line, Channel& channel) {
         module->build_info(channel);
     }
 
-#ifdef ENABLE_FW_JOG
-    // Firmware-native vector-jog capability advertisement. Lets a sender feature-detect the
-    // $Jog/* engine instead of probing. git_info rides along as VER= (build identity).
-    Machine::reportFwJogCapabilities(channel, git_info);
-#endif
+    Machine::reportFwJogCapabilities(channel, git_info, config && config->_thc && config->_thc->manualLeaseSupported(),
+                                     Machine::HasFwJog);
 }
 
 // Prints the character string line that was received, which has been pre-parsed,

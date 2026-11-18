@@ -5,6 +5,8 @@
 
 #include "MachineConfig.h"  // config, Axes, Stepping
 #include "../Stepper.h"     // coherent executing-segment speed and programmed feed
+#include "../Limit.h"
+#include "../State.h"
 #include "../Logging.h"     // LogStream, log_*
 
 #include <cmath>
@@ -84,8 +86,11 @@ namespace Machine {
         serviceArgs.name                    = "thc_service";
         esp_timer_handle_t serviceHandle;
         if (esp_timer_create(&serviceArgs, &serviceHandle) == ESP_OK) {
-            esp_timer_start_periodic(serviceHandle, 1000);  // 1 kHz
-            _service_timer = serviceHandle;
+            if (esp_timer_start_periodic(serviceHandle, 1000) == ESP_OK) {
+                _service_timer = serviceHandle;
+            } else {
+                esp_timer_delete(serviceHandle);
+            }
         }
 
         esp_timer_create_args_t stepArgs = {};
@@ -94,10 +99,50 @@ namespace Machine {
         stepArgs.name                    = "thc_step";
         esp_timer_handle_t stepHandle;
         if (esp_timer_create(&stepArgs, &stepHandle) == ESP_OK) {
-            esp_timer_start_periodic(stepHandle, 1000000 / StepTimerHz);
-            _step_timer = stepHandle;
+            if (esp_timer_start_periodic(stepHandle, 1000000 / StepTimerHz) == ESP_OK) {
+                _step_timer = stepHandle;
+            } else {
+                esp_timer_delete(stepHandle);
+            }
         }
 #endif
+    }
+
+    bool THC::manualLeaseSupported() const {
+#ifdef __FLUIDNC
+        return _service_timer && _step_timer && _manual_rate_hz > 0.0f;
+#else
+        return false;
+#endif
+    }
+
+    void THC::manualLeaseStart(int direction) {
+#ifdef __FLUIDNC
+        if (manualLeaseSupported() && _ovr_mode.load() == (int)ThcOvrMode::Disabled) {
+            _manual_dir.store(0);
+            _manual_lease.start(direction, uint32_t(esp_timer_get_time() / 1000));
+        }
+#endif
+    }
+
+    void THC::manualLeaseRenew() {
+#ifdef __FLUIDNC
+        _manual_lease.renew(uint32_t(esp_timer_get_time() / 1000));
+#endif
+    }
+
+    void THC::ovrCaptureArc() {
+        if (!manualLeaseSupported() || _ovr_mode.load() != (int)ThcOvrMode::Disabled) {
+            return;
+        }
+        const auto motion = Stepper::get_executing_motion();
+        const float volts = std::round(_arc_volts.load());
+        if (!motion.valid || !motion.cutting || !std::isfinite(volts) || volts <= _min_arc_voltage || volts <= 0 || volts > 300) {
+            return;
+        }
+        manualCompStop();
+        _ovr_volts.store(volts);
+        _ovr_mode.store((int)ThcOvrMode::Override);
     }
 
     // ------------------------------ control loop ------------------------------
@@ -169,7 +214,11 @@ namespace Machine {
         // Manual compensation overrides the control loop: while a comp direction is held,
         // drive Z up/down at the manual rate regardless of arc voltage. GcodePilot switches
         // the override to Disabled before sending comp commands, so the loop is already idle.
-        int manual = _manual_dir.load();
+        const bool leaseEligible = state_is(State::Cycle) && motion.valid && motion.cutting &&
+                                   _ovr_mode.load() == (int)ThcOvrMode::Disabled;
+        const int leased = _manual_lease.direction(uint32_t(now / 1000), leaseEligible);
+        _leased_step = leased != 0;
+        const int manual = _leased_step ? leased : _manual_dir.load();
         if (manual != 0) {
             int mdir = _invert_z ? -manual : manual;
             _step_dir.store(mdir);
@@ -216,6 +265,23 @@ namespace Machine {
             _step_phase -= 1.0f;
             if (_step_phase > 1.0f) {
                 _step_phase = 0.0f;  // rate exceeded the timer; never queue a backlog
+            }
+            if (_leased_step) {
+#ifdef __FLUIDNC
+                const int leased = _manual_lease.direction(uint32_t(esp_timer_get_time() / 1000), state_is(State::Cycle));
+                if (!leased || dir != (_invert_z ? -leased : leased)) {
+                    return;
+                }
+#endif
+                auto z = config->_axes->_axis[Z_AXIS];
+                if (z && z->_softLimits) {
+                    const float next = (float(Stepping::getSteps(Z_AXIS)) + dir) / z->_stepsPerMm;
+                    if ((dir > 0 && next > limitsMaxPosition(Z_AXIS)) ||
+                        (dir < 0 && next < limitsMinPosition(Z_AXIS))) {
+                        _manual_lease.stop();
+                        return;
+                    }
+                }
             }
             Stepping::thcStep(Z_AXIS, dir > 0);
         }
